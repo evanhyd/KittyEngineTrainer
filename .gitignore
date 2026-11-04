@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target
+
+# Binary NNUE weights, checkpoints, and datasets
+*.bin
+*.binpack
+/checkpoints
+/data
+/scratch
+
+# Compiled native binaries and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+*.obj
+*.o
+*.a
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
