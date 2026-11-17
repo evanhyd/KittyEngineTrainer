@@ -696,6 +696,8 @@ fn run_train(args: &[String], is_resume: bool) {
         let step_lr = min_lr + 0.5 * (max_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos());
         println!("  Active Learning Rate: {:.7} (Cosine Annealing: {:.1}% progress)", step_lr, progress * 100.0);
 
+        let is_flush_step = (step % save_interval == 0) || (step == superbatches);
+
         let schedule = TrainingSchedule {
             net_id: net_id.clone(),
             eval_scale: SCALE,
@@ -707,10 +709,18 @@ fn run_train(args: &[String], is_resume: bool) {
             },
             wdl_scheduler: wdl::ConstantWDL { value: wdl_val },
             lr_scheduler: lr::ConstantLR { value: step_lr },
-            save_rate: 1,
+            save_rate: save_interval,
         };
 
         trainer.run(&schedule, &settings, &data_loader);
+
+        if !is_flush_step {
+            let next_flush = ((step / save_interval) + 1) * save_interval;
+            println!("⏩ [Step {}/{}] Superbatch complete (training only). Next weight flush & SPRT verification at step {}.",
+                step, superbatches, next_flush.min(superbatches)
+            );
+            continue;
+        }
 
         let checkpoint_dir = format!("checkpoints/{net_id}-{step}");
         let raw_path = format!("{checkpoint_dir}/raw.bin");
@@ -718,17 +728,13 @@ fn run_train(args: &[String], is_resume: bool) {
         let periodic_bin = format!("checkpoints/weights_step_{step}.bin");
 
         if Path::new(&raw_path).exists() {
-            println!("\nExporting step {} checkpoint to {}...", step, exported_bin);
-            if let Err(e) = export::export_from_raw_checkpoint(Path::new(&raw_path), Path::new(&exported_bin)) {
+            println!("\nExporting step {} checkpoint to {}...", step, periodic_bin);
+            if let Err(e) = export::export_from_raw_checkpoint(Path::new(&raw_path), Path::new(&periodic_bin)) {
                 eprintln!("Failed to export weights for step {}: {}", step, e);
                 continue;
             }
-
-            let is_save_interval = step % save_interval == 0;
-            if is_save_interval {
-                let _ = fs::copy(&exported_bin, &periodic_bin);
-                println!("💾 Preserved tournament checkpoint: {}", periodic_bin);
-            }
+            let _ = fs::copy(&periodic_bin, &exported_bin);
+            println!("💾 Flushed tournament checkpoint: {}", periodic_bin);
 
             println!("\nEvaluating checkpoint across ALL {} packs ({} pos/pack)...", total_packs, eval_positions_per_pack);
             match eval::evaluate_checkpoint_packs(Path::new(&exported_bin), &data_files, eval_positions_per_pack, wdl_val) {
@@ -797,17 +803,11 @@ fn run_train(args: &[String], is_resume: bool) {
                                 } else {
                                     println!("\n❌ Step {} did not beat active Champion under SPRT.", step);
                                     println!("  Score: Candidate +{} -{} ={}", res.wins, res.losses, res.draws);
-                                    if !is_save_interval {
-                                        let _ = fs::remove_file(&exported_bin);
-                                    }
                                 }
                                 (passed, Some(res))
                             }
                             Err(e) => {
                                 eprintln!("[sprt] SPRT execution error: {}", e);
-                                if !is_save_interval {
-                                    let _ = fs::remove_file(&exported_bin);
-                                }
                                 (false, None)
                             }
                         }

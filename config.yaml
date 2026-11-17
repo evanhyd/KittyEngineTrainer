@@ -23,7 +23,7 @@ eval_positions_per_pack: 2000000
 # Periodic weight export interval
 # Automatically exports and preserves 'checkpoints/weights_step_<N>.bin' every N superbatches
 # Set to 1 to keep every superbatch, or 2, 5, etc. for tournament playtesting checkpoints
-save_interval: 1
+save_interval: 5
 
 # Positive Bias Initialization (Layer 0, Layer 1, Layer 2)
 bias_l0: 0.05
@@ -45,7 +45,7 @@ sprt:
   book_depth: 3
   time_control: "8+0.1"
   concurrency: 12
-  max_rounds: 200
+  max_rounds: 100
   elo0: 0.0
   elo1: 10.0
   alpha: 0.05
