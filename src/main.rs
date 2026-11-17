@@ -1350,7 +1350,7 @@ fn update_readme_dashboard(
     let y_max = (max_smse * 1.15).max(0.5);
 
     let mut table_rows = String::new();
-    for h in history.iter().rev() {
+    for h in history.iter().rev().take(15) {
         let status_emoji = if h.promoted { "👑 Promoted Champion" } else { "Training Step" };
         let pos_str = if h.positions >= 1_000_000_000 {
             format!("{:.2}B", h.positions as f64 / 1_000_000_000.0)
@@ -1376,10 +1376,12 @@ xychart-beta\n\
     line [{lines}]\n\
 ```\n\
 *(Bars: MAE | Line: SMSE)*\n\n\
-### Performance Metrics Table\n\n\
+### Performance Metrics Table (Recent Steps)\n\n\
 | Step / Checkpoint | Epoch | Positions Trained | WDL | Overall MAE | Overall SMSE | MSE | Mate MAE | Non-Mate MAE | Status |\n\
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n\
-{table_rows}{end_tag}",
+{table_rows}\n\
+*(Displaying last 15 steps. Full historical log preserved in `checkpoints/training_history.json` or inspect via `cargo run --release -- status`)*\n\
+{end_tag}",
         start_tag = start_tag,
         end_tag = end_tag,
         wdl = wdl,
