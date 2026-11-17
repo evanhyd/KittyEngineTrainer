@@ -208,7 +208,7 @@ pub fn analyze_weights(
                             chunk_diag.accum_combined.neurons[i].record(max_pre, max_act);
                         }
 
-                        // 2. Hidden Layer 1 forward pass
+                        // 2. Hidden Layer 1 forward pass (512 -> 32)
                         let mut h1 = [0.0f32; 32];
                         for i in 0..32 {
                             let row = &weights.l1w[i * 512..(i + 1) * 512];
@@ -224,7 +224,7 @@ pub fn analyze_weights(
                             chunk_diag.l1.neurons[i].record(dot, act);
                         }
 
-                        // 3. Hidden Layer 2 forward pass
+                        // 3. Hidden Layer 2 forward pass (32 -> 32)
                         let mut h2 = [0.0f32; 32];
                         for j in 0..32 {
                             let row = &weights.l2w[j * 32..(j + 1) * 32];

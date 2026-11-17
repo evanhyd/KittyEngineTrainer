@@ -4,9 +4,11 @@
 # Binary NNUE weights, checkpoints, and datasets
 *.bin
 *.binpack
-/checkpoints
-/data
-/scratch
+*.nnue
+/checkpoints/
+checkpoints_*/
+/data/
+/scratch/
 
 # Compiled native binaries and libraries
 *.exe

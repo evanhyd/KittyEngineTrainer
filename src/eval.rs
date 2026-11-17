@@ -6,7 +6,7 @@ use bulletformat::{BulletFormat, ChessBoard, DataLoader};
 use crate::inputs::KittyHalfKA;
 use bullet_lib::game::inputs::SparseInputType;
 
-const MAGIC_V5: &[u8; 8] = b"NNUESGD5";
+const MAGIC_V6: &[u8; 8] = b"NNUESGD6";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ErrorStats {
@@ -77,31 +77,32 @@ pub struct NnueWeights {
     pub l1w: Vec<f32>,
     pub l2b: [f32; 32],
     pub l2w: Vec<f32>,
-    pub l3b: f32,
-    pub l3w: [f32; 32],
+    pub l3b: [f32; 8],
+    pub l3w: Vec<f32>,
 }
 
 impl NnueWeights {
     pub fn load_from_file(path: &Path) -> io::Result<Self> {
         let bytes = std::fs::read(path)?;
-        if bytes.len() != 50_402_756 {
+        if bytes.len() != 25_237_864 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected 50,402,756 bytes, got {}", bytes.len()),
+                format!("Expected 25,237,864 bytes, got {}", bytes.len()),
             ));
         }
 
-        if &bytes[0..8] != MAGIC_V5 {
+        if &bytes[0..8] != MAGIC_V6 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid NNUESGD signature (expected NNUESGD5)",
+                "Invalid NNUESGD signature (expected NNUESGD6)",
             ));
         }
 
+        // Header is 72 bytes (8 magic + 40 dimensions + 24 progress)
         let payload_floats: &[f32] = unsafe {
             std::slice::from_raw_parts(
-                bytes[64..].as_ptr() as *const f32,
-                (bytes.len() - 64) / 4,
+                bytes[72..].as_ptr() as *const f32,
+                (bytes.len() - 72) / 4,
             )
         };
 
@@ -110,8 +111,8 @@ impl NnueWeights {
         let l0b = payload_floats[offset..offset + 256].to_vec();
         offset += 256;
 
-        let l0w = payload_floats[offset..offset + 49_152 * 256].to_vec();
-        offset += 49_152 * 256;
+        let l0w = payload_floats[offset..offset + 24_576 * 256].to_vec();
+        offset += 24_576 * 256;
 
         let mut l1b = [0.0f32; 32];
         l1b.copy_from_slice(&payload_floats[offset..offset + 32]);
@@ -127,11 +128,11 @@ impl NnueWeights {
         let l2w = payload_floats[offset..offset + 32 * 32].to_vec();
         offset += 32 * 32;
 
-        let l3b = payload_floats[offset];
-        offset += 1;
+        let mut l3b = [0.0f32; 8];
+        l3b.copy_from_slice(&payload_floats[offset..offset + 8]);
+        offset += 8;
 
-        let mut l3w = [0.0f32; 32];
-        l3w.copy_from_slice(&payload_floats[offset..offset + 32]);
+        let l3w = payload_floats[offset..offset + 8 * 32].to_vec();
 
         Ok(Self { l0b, l0w, l1b, l1w, l2b, l2w, l3b, l3w })
     }
@@ -193,8 +194,13 @@ impl NnueWeights {
             h2[i] = Self::act(dot);
         }
 
-        let mut raw_eval = self.l3b;
-        for (h, &w) in h2.iter().zip(&self.l3w) {
+        // Material count output bucketing (0..7) matching Bullet MaterialCount<8> and KittyEngine
+        let occ = board.occ().count_ones() as usize;
+        let bucket = ((occ.saturating_sub(2)) / 4).min(7);
+
+        let mut raw_eval = self.l3b[bucket];
+        let b_weights = &self.l3w[bucket * 32..(bucket + 1) * 32];
+        for (h, &w) in h2.iter().zip(b_weights) {
             raw_eval += h * w;
         }
 
