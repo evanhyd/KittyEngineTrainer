@@ -198,6 +198,9 @@ fn run_status() {
     println!("  - SPRT Enabled:        {}", cfg.sprt.enabled);
     println!("  - Cutechess CLI:       {}", cfg.sprt.cutechess_path);
     println!("  - Engine Executable:   {}", cfg.sprt.engine_path);
+    if !cfg.sprt.engine_args.is_empty() {
+        println!("  - Engine Arguments:    {}", cfg.sprt.engine_args);
+    }
     println!("  - Time Control:        {}", cfg.sprt.time_control);
     println!("  - Concurrency:         {} threads", cfg.sprt.concurrency);
     println!("  - Max Rounds:          {}", cfg.sprt.max_rounds);

@@ -90,6 +90,7 @@ sprt:
   enabled: true
   cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
   engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  engine_args: "--mode bullet"
   book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
   book_depth: 8
   time_control: "5+0.1"

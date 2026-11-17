@@ -3,7 +3,7 @@
 # ==============================================================================
 
 # Total target superbatches for the training run
-superbatches: 200
+superbatches: 300
 
 # WDL lambda distillation factor (0.0 = pure centipawns, 1.0 = pure WDL outcome)
 wdl: 0.20
@@ -39,11 +39,12 @@ bias_l2: 0.35
 sprt:
   enabled: true
   cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
-  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  engine_path: "C:/Users/evanh/works/software/cutechess/engines/KittyEngineV5_experimental/KittyEngineV5.exe"
+  engine_args: "--mode bullet"
   book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
-  book_depth: 8
-  time_control: "5+0.1"
-  concurrency: 2
+  book_depth: 3
+  time_control: "8+0.1"
+  concurrency: 12
   max_rounds: 200
   elo0: 0.0
   elo1: 5.0
@@ -52,5 +53,5 @@ sprt:
   draw_movenumber: 40
   draw_movecount: 8
   draw_score: 10
-  resign_movecount: 4
-  resign_score: 550
+  resign_movecount: 10
+  resign_score: 500

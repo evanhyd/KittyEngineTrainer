@@ -12,6 +12,56 @@ pub const SPRT_GAMES_PGN: &str = "checkpoints/sprt_games.pgn";
 fn default_true() -> bool { true }
 fn default_cutechess_path() -> String { "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe".to_string() }
 fn default_engine_path() -> String { "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe".to_string() }
+fn default_engine_args() -> String { String::new() }
+
+fn deserialize_engine_args<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrVec {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string, list of arguments, or empty")
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(s.to_string())
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: serde::de::SeqAccess<'de>,
+        {
+            let mut list = Vec::new();
+            while let Some(elem) = seq.next_element::<String>()? {
+                list.push(elem);
+            }
+            Ok(list.join(" "))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(String::new())
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(String::new())
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
+}
 fn default_book_path() -> String { "C:/Users/evanh/works/software/cutechess/book/book.bin".to_string() }
 fn default_book_depth() -> usize { 8 }
 fn default_time_control() -> String { "5+0.1".to_string() }
@@ -35,6 +85,8 @@ pub struct SprtConfig {
     pub cutechess_path: String,
     #[serde(default = "default_engine_path")]
     pub engine_path: String,
+    #[serde(default = "default_engine_args", deserialize_with = "deserialize_engine_args")]
+    pub engine_args: String,
     #[serde(default = "default_book_path")]
     pub book_path: String,
     #[serde(default = "default_book_depth")]
@@ -71,6 +123,7 @@ impl Default for SprtConfig {
             enabled: default_true(),
             cutechess_path: default_cutechess_path(),
             engine_path: default_engine_path(),
+            engine_args: default_engine_args(),
             book_path: default_book_path(),
             book_depth: default_book_depth(),
             time_control: default_time_control(),
@@ -165,6 +218,7 @@ sprt:
   enabled: true
   cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
   engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  engine_args: ""
   book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
   book_depth: 8
   time_control: "5+0.1"

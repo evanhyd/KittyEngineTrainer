@@ -178,6 +178,9 @@ pub fn run_sprt_match(
     println!("  Candidate:      {}", candidate_weights.display());
     println!("  Champion:       {}", champion_weights.display());
     println!("  Engine Binary:  {}", config.engine_path);
+    if !config.engine_args.is_empty() {
+        println!("  Engine Args:    {}", config.engine_args);
+    }
     println!("  Opening Book:   {} (depth: {})", config.book_path, config.book_depth);
     println!("  Time Control:   {} | Concurrency: {} | Max Rounds: {}",
         config.time_control, config.concurrency, config.max_rounds);
@@ -188,18 +191,51 @@ pub fn run_sprt_match(
     println!("--------------------------------------------------------------------------------");
 
     // 2. Build cutechess command
+    let mut engine_args: Vec<String> = Vec::new();
+    for token in config.engine_args.split_whitespace() {
+        match token {
+            "--bullet" => {
+                engine_args.push("--mode".to_string());
+                engine_args.push("bullet".to_string());
+            }
+            "--blitz" => {
+                engine_args.push("--mode".to_string());
+                engine_args.push("blitz".to_string());
+            }
+            "--rapid" => {
+                engine_args.push("--mode".to_string());
+                engine_args.push("rapid".to_string());
+            }
+            "--classical" => {
+                engine_args.push("--mode".to_string());
+                engine_args.push("classical".to_string());
+            }
+            other => {
+                engine_args.push(other.to_string());
+            }
+        }
+    }
+
     let mut cmd = Command::new(&config.cutechess_path);
     cmd.arg("-engine")
         .arg("name=Candidate")
         .arg(format!("cmd={}", config.engine_path))
-        .arg(format!("dir={}", candidate_dir.display()))
-        .arg("proto=uci")
-        .arg("-engine")
+        .arg(format!("dir={}", candidate_dir.display()));
+    for arg in &engine_args {
+        cmd.arg(format!("arg={}", arg));
+    }
+    cmd.arg("proto=uci");
+
+    cmd.arg("-engine")
         .arg("name=Champion")
         .arg(format!("cmd={}", config.engine_path))
-        .arg(format!("dir={}", champion_dir.display()))
-        .arg("proto=uci")
-        .arg("-each")
+        .arg(format!("dir={}", champion_dir.display()));
+    for arg in &engine_args {
+        cmd.arg(format!("arg={}", arg));
+    }
+    cmd.arg("proto=uci");
+
+    cmd.arg("-each")
         .arg(format!("tc={}", config.time_control))
         .arg(format!("book={}", config.book_path))
         .arg(format!("bookdepth={}", config.book_depth))
@@ -403,8 +439,14 @@ pub fn run_sprt_match(
         0.0
     };
 
+    let args_suffix = if config.engine_args.is_empty() {
+        String::new()
+    } else {
+        format!(" | Args: {}", config.engine_args)
+    };
+
     let log_entry = format!(
-        "[{}] SPRT MATCH\n  Candidate: {}\n  Champion:  {}\n  Verdict:   {}\n  Score:     +{} -{} ={} (total: {}) ({:.1}%)\n  Elo Diff:  {}\n  SPRT LLR:  {}\n  TC: {} | Concurrency: {} | Book: {} (depth {})\n  --------------------------------------------------------------------------------",
+        "[{}] SPRT MATCH\n  Candidate: {}\n  Champion:  {}\n  Verdict:   {}\n  Score:     +{} -{} ={} (total: {}) ({:.1}%)\n  Elo Diff:  {}\n  SPRT LLR:  {}\n  TC: {} | Concurrency: {} | Book: {} (depth {}){}\n  --------------------------------------------------------------------------------",
         current_timestamp(),
         candidate_weights.display(),
         champion_weights.display(),
@@ -412,7 +454,8 @@ pub fn run_sprt_match(
         wins, losses, draws, total_games, win_pct,
         elo_str,
         llr_str,
-        config.time_control, config.concurrency, config.book_path, config.book_depth
+        config.time_control, config.concurrency, config.book_path, config.book_depth,
+        args_suffix
     );
     append_to_match_log(&log_entry);
 
@@ -438,6 +481,7 @@ mod tests {
     fn test_sprt_config_defaults() {
         let cfg = SprtConfig::default();
         assert!(cfg.enabled);
+        assert_eq!(cfg.engine_args, "");
         assert_eq!(cfg.concurrency, 2);
         assert_eq!(cfg.max_rounds, 200);
         assert_eq!(cfg.time_control, "5+0.1");
