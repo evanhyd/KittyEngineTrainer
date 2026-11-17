@@ -765,6 +765,11 @@ fn run_train(args: &[String], is_resume: bool) {
                         let _ = fs::copy(&exported_bin, CHAMPION_FILE);
                         baseline_mae = overall.mae();
                         baseline_smse = overall.smse();
+                        let base_entry = format!(
+                            "[{}] BASELINE CHAMPION ESTABLISHED\n  Step:    {}\n  Weights: {}\n  MAE:     {:.6} | SMSE: {:.6}\n  --------------------------------------------------------------------------------",
+                            sprt::current_timestamp(), step, CHAMPION_FILE, baseline_mae, baseline_smse
+                        );
+                        sprt::append_to_match_log(&base_entry);
                         (true, None)
                     } else if cfg.sprt.enabled {
                         println!("\n⚔️ RUNNING AUTOMATED SPRT PROMOTION MATCH (Candidate Step {} vs Active Champion)...", step);
@@ -779,6 +784,13 @@ fn run_train(args: &[String], is_resume: bool) {
                                     let _ = fs::copy(&exported_bin, CHAMPION_FILE);
                                     baseline_mae = overall.mae();
                                     baseline_smse = overall.smse();
+                                    let promo_entry = format!(
+                                        "[{}] 👑 CHAMPION PROMOTED\n  Step:     {}\n  Score:    +{} -{} ={} | Elo: {:+.1} +/- {:.1}\n  Promoted: {}\n  --------------------------------------------------------------------------------",
+                                        sprt::current_timestamp(), step, res.wins, res.losses, res.draws,
+                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0),
+                                        CHAMPION_FILE
+                                    );
+                                    sprt::append_to_match_log(&promo_entry);
                                 } else {
                                     println!("\n❌ Step {} did not beat active Champion under SPRT.", step);
                                     println!("  Score: Candidate +{} -{} ={}", res.wins, res.losses, res.draws);

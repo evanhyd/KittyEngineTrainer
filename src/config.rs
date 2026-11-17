@@ -6,6 +6,8 @@ pub const DATA_DIR: &str = "data";
 pub const CHECKPOINTS_DIR: &str = "checkpoints";
 pub const CHAMPION_FILE: &str = "checkpoints/champion_weights.bin";
 pub const SCRATCH_FILE: &str = "checkpoints/scratch_weights_init.bin";
+pub const SPRT_MATCH_LOG: &str = "checkpoints/sprt_matches.log";
+pub const SPRT_GAMES_PGN: &str = "checkpoints/sprt_games.pgn";
 
 fn default_true() -> bool { true }
 fn default_cutechess_path() -> String { "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe".to_string() }

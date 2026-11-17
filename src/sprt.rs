@@ -1,8 +1,57 @@
-use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use crate::config::SprtConfig;
+use crate::config::{SprtConfig, SPRT_GAMES_PGN, SPRT_MATCH_LOG};
+
+/// Returns the current UTC timestamp formatted as YYYY-MM-DD HH:MM:SS UTC.
+pub fn current_timestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let sec = now % 60;
+    let min = (now / 60) % 60;
+    let hour = (now / 3600) % 24;
+    let days = now / 86400;
+
+    let mut year = 1970;
+    let mut d = days;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_year = if leap { 366 } else { 365 };
+        if d < days_in_year {
+            let month_days = if leap {
+                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+            let mut month = 1;
+            for &md in &month_days {
+                if d < md {
+                    break;
+                }
+                d -= md;
+                month += 1;
+            }
+            let day = d + 1;
+            return format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", year, month, day, hour, min, sec);
+        }
+        d -= days_in_year;
+        year += 1;
+    }
+}
+
+/// Appends a log entry to the standard SPRT match audit log (`checkpoints/sprt_matches.log`).
+pub fn append_to_match_log(msg: &str) {
+    let log_path = Path::new(SPRT_MATCH_LOG);
+    if let Some(parent) = log_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "{}", msg);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SprtDecision {
@@ -174,6 +223,15 @@ pub fn run_sprt_match(
         .arg(format!("alpha={}", config.alpha))
         .arg(format!("beta={}", config.beta));
 
+    // Record full games to standard default PGN file
+    let pgn_path = Path::new(SPRT_GAMES_PGN);
+    if let Some(parent) = pgn_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    cmd.arg("-pgnout")
+        .arg(pgn_path)
+        .arg("fi");
+
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -322,6 +380,42 @@ pub fn run_sprt_match(
     }
     println!("================================================================================\n");
 
+    let verdict_str = match &decision {
+        SprtDecision::AcceptedH1 => "ACCEPTED H1 (Candidate statistically superior)",
+        SprtDecision::AcceptedH0 => "ACCEPTED H0 (Candidate failed to beat Champion)",
+        SprtDecision::Inconclusive => "INCONCLUSIVE (Max rounds reached)",
+    };
+    let elo_str = if let (Some(diff), Some(err)) = (elo_diff, elo_error) {
+        format!("{:+.1} +/- {:.1}", diff, err)
+    } else if let Some(diff) = elo_diff {
+        format!("{:+.1}", diff)
+    } else {
+        "N/A".to_string()
+    };
+    let llr_str = if let (Some(l), Some(lb), Some(ub)) = (llr, lbound, ubound) {
+        format!("{:.4} [Bounds: {:.2}, {:.2}]", l, lb, ub)
+    } else {
+        "N/A".to_string()
+    };
+    let win_pct = if total_games > 0 {
+        (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let log_entry = format!(
+        "[{}] SPRT MATCH\n  Candidate: {}\n  Champion:  {}\n  Verdict:   {}\n  Score:     +{} -{} ={} (total: {}) ({:.1}%)\n  Elo Diff:  {}\n  SPRT LLR:  {}\n  TC: {} | Concurrency: {} | Book: {} (depth {})\n  --------------------------------------------------------------------------------",
+        current_timestamp(),
+        candidate_weights.display(),
+        champion_weights.display(),
+        verdict_str,
+        wins, losses, draws, total_games, win_pct,
+        elo_str,
+        llr_str,
+        config.time_control, config.concurrency, config.book_path, config.book_depth
+    );
+    append_to_match_log(&log_entry);
+
     Ok(SprtMatchResult {
         decision,
         wins,
@@ -381,5 +475,12 @@ mod tests {
             SprtDecision::Inconclusive
         };
         assert_eq!(dec_inc, SprtDecision::Inconclusive);
+    }
+
+    #[test]
+    fn test_current_timestamp() {
+        let ts = current_timestamp();
+        assert!(ts.ends_with(" UTC"));
+        assert_eq!(ts.len(), 23); // "YYYY-MM-DD HH:MM:SS UTC"
     }
 }
