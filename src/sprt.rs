@@ -487,9 +487,9 @@ mod tests {
         assert_eq!(cfg.time_control, "5+0.1");
         assert_eq!(cfg.book_depth, 8);
         assert_eq!(cfg.elo0, 0.0);
-        assert_eq!(cfg.elo1, 5.0);
+        assert_eq!(cfg.elo1, 10.0);
         assert_eq!(cfg.alpha, 0.05);
-        assert_eq!(cfg.beta, 0.05);
+        assert_eq!(cfg.beta, 0.15);
         assert_eq!(cfg.draw_movenumber, 40);
         assert_eq!(cfg.draw_movecount, 8);
         assert_eq!(cfg.draw_score, 10);

@@ -68,9 +68,9 @@ fn default_time_control() -> String { "5+0.1".to_string() }
 fn default_concurrency() -> usize { 2 }
 fn default_max_rounds() -> usize { 200 }
 fn default_elo0() -> f64 { 0.0 }
-fn default_elo1() -> f64 { 5.0 }
+fn default_elo1() -> f64 { 10.0 }
 fn default_alpha() -> f64 { 0.05 }
-fn default_beta() -> f64 { 0.05 }
+fn default_beta() -> f64 { 0.15 }
 fn default_draw_movenumber() -> usize { 40 }
 fn default_draw_movecount() -> usize { 8 }
 fn default_draw_score() -> i32 { 10 }
@@ -225,9 +225,9 @@ sprt:
   concurrency: 2
   max_rounds: 200
   elo0: 0.0
-  elo1: 5.0
+  elo1: 10.0
   alpha: 0.05
-  beta: 0.05
+  beta: 0.15
   draw_movenumber: 40
   draw_movecount: 8
   draw_score: 10

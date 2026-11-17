@@ -47,9 +47,9 @@ sprt:
   concurrency: 12
   max_rounds: 200
   elo0: 0.0
-  elo1: 5.0
+  elo1: 10.0
   alpha: 0.05
-  beta: 0.05
+  beta: 0.15
   draw_movenumber: 40
   draw_movecount: 8
   draw_score: 10
