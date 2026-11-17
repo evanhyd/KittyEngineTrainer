@@ -1219,7 +1219,7 @@ fn run_train(args: &[String], is_resume: bool) {
 
                     }
 
-                    update_readme_dashboard(
+                    record_training_history(
                         step,
                         epoch,
                         global_batch_start * batch_size + positions_per_superbatch,
@@ -1264,7 +1264,7 @@ struct HistoryEntry {
     promoted: bool,
 }
 
-fn update_readme_dashboard(
+fn record_training_history(
     step: usize,
     epoch: usize,
     positions: usize,
@@ -1303,98 +1303,6 @@ fn update_readme_dashboard(
 
     if let Ok(json_str) = serde_json::to_string_pretty(&history) {
         let _ = fs::write(history_path, json_str);
-    }
-
-    let readme_path = Path::new("README.md");
-    if !readme_path.exists() {
-        return;
-    }
-    let readme_content = match fs::read_to_string(readme_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let start_tag = "<!-- DASHBOARD_START -->";
-    let end_tag = "<!-- DASHBOARD_END -->";
-
-    let (before, after) = match (readme_content.find(start_tag), readme_content.find(end_tag)) {
-        (Some(s), Some(e)) if s < e => (&readme_content[..s], &readme_content[e + end_tag.len()..]),
-        _ => return,
-    };
-
-    // Subsample up to 20 points for chart if history is long
-    let display_history = if history.len() > 20 {
-        let stride = (history.len() + 19) / 20;
-        let mut sampled = Vec::new();
-        for (i, h) in history.iter().enumerate() {
-            if i % stride == 0 || i == history.len() - 1 {
-                sampled.push(h.clone());
-            }
-        }
-        sampled
-    } else {
-        history.clone()
-    };
-
-    let mut x_labels = Vec::new();
-    let mut mae_bars = Vec::new();
-    let mut smse_lines = Vec::new();
-
-    for h in &display_history {
-        x_labels.push(format!("\"Step {}\"", h.step));
-        mae_bars.push(format!("{:.3}", h.mae));
-        smse_lines.push(format!("{:.3}", h.smse));
-    }
-
-    let max_smse = display_history.iter().map(|h| h.smse).fold(1.0f64, f64::max);
-    let y_max = (max_smse * 1.15).max(0.5);
-
-    let mut table_rows = String::new();
-    for h in history.iter().rev().take(15) {
-        let status_emoji = if h.promoted { "👑 Promoted Champion" } else { "Training Step" };
-        let pos_str = if h.positions >= 1_000_000_000 {
-            format!("{:.2}B", h.positions as f64 / 1_000_000_000.0)
-        } else {
-            format!("{:.1}M", h.positions as f64 / 1_000_000.0)
-        };
-        table_rows.push_str(&format!(
-            "| **Step {}** | {} | {} | {:.2} | **{:.7}** | **{:.7}** | {:.7} | {:.7} | {:.7} | {} |\n",
-            h.step, h.epoch, pos_str, h.wdl, h.mae, h.smse, h.mse, h.mate_mae, h.non_mate_mae, status_emoji
-        ));
-    }
-
-    let dashboard = format!(
-"{start_tag}\n\
-## 📈 Training Progress & Benchmark Dashboard\n\n\
-### Metric Trajectory (MAE & SMSE)\n\n\
-```mermaid\n\
-xychart-beta\n\
-    title \"Validation Loss & Error Trajectory on New 1.09B Dataset (WDL={wdl:.2})\"\n\
-    x-axis [{x_axis}]\n\
-    y-axis \"Score\" 0.0 --> {y_max:.2}\n\
-    bar [{bars}]\n\
-    line [{lines}]\n\
-```\n\
-*(Bars: MAE | Line: SMSE)*\n\n\
-### Performance Metrics Table (Recent Steps)\n\n\
-| Step / Checkpoint | Epoch | Positions Trained | WDL | Overall MAE | Overall SMSE | MSE | Mate MAE | Non-Mate MAE | Status |\n\
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n\
-{table_rows}\n\
-*(Displaying last 15 steps. Full historical log preserved in `checkpoints/training_history.json` or inspect via `cargo run --release -- status`)*\n\
-{end_tag}",
-        start_tag = start_tag,
-        end_tag = end_tag,
-        wdl = wdl,
-        x_axis = x_labels.join(", "),
-        y_max = y_max,
-        bars = mae_bars.join(", "),
-        lines = smse_lines.join(", "),
-        table_rows = table_rows,
-    );
-
-    let new_readme = format!("{}{}{}", before, dashboard, after);
-    if let Ok(()) = fs::write(readme_path, new_readme) {
-        println!("  Updated README.md dashboard with Step {} metrics and Mermaid chart.", step);
     }
 }
 
