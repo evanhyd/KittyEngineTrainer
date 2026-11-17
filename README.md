@@ -1,6 +1,6 @@
 # KittyEngineTrainer
 
-High-performance GPU-accelerated NNUE trainer for **KittyEngine**, powered by [Bullet](https://github.com/jw1912/bullet) and CUDA. Features a config-driven architecture, automated checkpoint evaluation across multi-pack streams, and standalone tournament playtest weight preservation.
+High-performance GPU-accelerated NNUE trainer for **KittyEngine**, powered by [Bullet](https://github.com/jw1912/bullet) and CUDA. Features a config-driven pipeline, multi-pack validation streaming, standalone playtest weight archiving, and automated Cutechess-CLI Sequential Probability Ratio Test (SPRT) verification as the exclusive gate for champion promotion.
 
 ---
 
@@ -20,9 +20,38 @@ High-performance GPU-accelerated NNUE trainer for **KittyEngine**, powered by [B
 
 ---
 
+## ⚔️ Automated SPRT Verification & Promotion
+
+KittyEngineTrainer uses live engine-vs-engine playtesting as the **exclusive gate** for champion weight promotion. Static validation loss (MAE/SMSE) is monitored for health checks, but a candidate weight is promoted to champion **only** if it statistically proves superiority over the active champion in game play.
+
+### How It Works
+
+1. **Hypothesis Testing**: Evaluates $H_0: \Delta\text{Elo} \le \text{elo0}$ against $H_1: \Delta\text{Elo} \ge \text{elo1}$ with significance parameters $\alpha$ (Type I error) and $\beta$ (Type II error).
+2. **Zero-Binary Sandboxing**: Candidate and champion weights are staged as `weights.bin` in isolated temporary sandboxes (`checkpoints/sprt_sandbox/candidate` and `checkpoints/sprt_sandbox/champion`) alongside `search_config.yaml`. The engine binary runs from its build directory with `dir=` set to the sandbox, preventing file-locking collisions and binary duplication.
+3. **Automated Adjudication**: Fast-forwards obvious positions using Polyglot opening books, draw adjudication (e.g. 8 consecutive plies with score $\le 10\text{ cp}$ after move 40), and resign adjudication (score $\le -550\text{ cp}$ for 4 plies).
+4. **Promotion Decision**:
+   - **$H_1$ Accepted**: The candidate is statistically superior $\to$ instantly promoted to `checkpoints/champion_weights.bin` and recorded in `baseline.json`.
+   - **$H_0$ Accepted / Inconclusive**: Candidate failed to beat the champion $\to$ champion retained; unpromoted checkpoint weights are cleaned up unless `save_interval` preserves them.
+
+---
+
+## 📊 Telemetry & Logging
+
+All logs use standard default paths under `checkpoints/` without configuration clutter:
+
+| Log File | Format | Description |
+| :--- | :--- | :--- |
+| **`checkpoints/sprt_matches.log`** | Human-readable text audit | Timestamped log of every SPRT match, including candidate vs. champion paths, final verdicts, scores (+W -L =D), win percentages, Elo estimates with error margins, SPRT LLR, and explicit promotion notices (`👑 CHAMPION PROMOTED`). |
+| **`checkpoints/sprt_games.pgn`** | Standard chess PGN | Live-flushed (`fi`) by Cutechess after every finished game. Records full PGN move history, search depths, evaluations, clock times, book annotations, and termination reasons for replay in any chess GUI. |
+| **`checkpoints/baseline.json`** | Structured JSON | Tracks active champion metrics (MAE, SMSE, WDL) and verified SPRT match telemetry. |
+| **`checkpoints/training_history.json`** | Structured JSON array | Complete chronological history of all superbatch steps, validation metrics, promotion outcomes, and SPRT statistics. |
+| **Console Stream** | Real-time stdout | Live updates of finished games, running match scores, and current SPRT LLR bounds. |
+
+---
+
 ## ⚙️ Configuration (`config.yaml`)
 
-Training parameters, learning rate decay, validation batch sizes, positive bias initializations, and tournament export intervals are centrally managed in `config.yaml`:
+Training parameters, learning rate decay, validation batch sizes, positive bias initializations, and SPRT match settings are centrally configured:
 
 ```yaml
 # Total target superbatches for the training run
@@ -45,7 +74,7 @@ eval_positions_per_pack: 2000000
 
 # Periodic weight export interval
 # Automatically exports and preserves 'checkpoints/weights_step_<N>.bin' every N superbatches
-# Set to 1 to preserve every superbatch for standalone engine playtesting tournaments (SPRT)
+# Set to 1 to preserve every superbatch for tournament playtesting
 save_interval: 1
 
 # Positive Bias Initialization (Layer 0, Layer 1, Layer 2)
@@ -53,8 +82,10 @@ bias_l0: 0.05
 bias_l1: 0.35
 bias_l2: 0.35
 
-# SPRT Automated Verification (Cutechess-CLI)
-# Exclusive gate for champion promotion: candidate promotes ONLY if H1 is accepted
+# ==============================================================================
+# SPRT (Sequential Probability Ratio Test) Automated Verification
+# ==============================================================================
+# SPRT is the EXCLUSIVE gate for champion promotion.
 sprt:
   enabled: true
   cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
@@ -79,19 +110,15 @@ sprt:
 
 ## 🚀 Command Reference
 
-The trainer provides a clean, single-word command interface:
-
-### Core Commands
-
 | Command | Usage | Description |
 | :--- | :--- | :--- |
 | **`status`** | `cargo run --release -- status` | **Instant inspection (<100ms)**: Displays active configuration, SPRT settings, current champion metrics, latest Bullet step, and recent training history. |
 | **`resume`** | `cargo run --release -- resume` | **One-click resume**: Auto-detects the latest checkpoint in `checkpoints/`, sets the next step, preserves smooth Cosine Annealing, and trains up to `superbatches`. |
 | **`train`** | `cargo run --release -- train` | **Start fresh**: Initializes fresh weights with positive biases (`0.05, 0.35, 0.35`), streams data from `data/`, evaluates checkpoints, and runs automated SPRT verification for champion promotion. |
-| **`sprt`** | `cargo run --release -- sprt [cand] [champ]` | **Playtesting verification**: Runs an automated Cutechess SPRT match between candidate and champion weights with live score and Elo telemetry. |
+| **`sprt`** | `cargo run --release -- sprt [cand] [champ]` | **Playtesting verification**: Runs an automated Cutechess SPRT match between candidate and champion weights with live score and Elo telemetry. Defaults to latest step vs champion. |
 | **`check`** | `cargo run --release -- check [weights.bin]` | **Unified audit**: Runs empirical Dead Neuron telemetry across all layers and detects high-centipawn polar sign disagreements against ground truth. |
 | **`eval`** | `cargo run --release -- eval [weights.bin]` | **Benchmark evaluation**: Measures MAE, SMSE, log-loss (BCE), MSE, RMSE, and mating accuracy across all dataset packs in `data/`. |
-| **`export`** | `cargo run --release -- export [step] [out.bin]` | **Weight export**: Converts any Bullet checkpoint (e.g. `export 115`) or raw checkpoint into KittyEngine binary format (`weights.bin` or custom name). |
+| **`export`** | `cargo run --release -- export [step] [out.bin]` | **Weight export**: Converts any Bullet checkpoint (e.g. `export 115`) into KittyEngine binary format (`weights.bin` or custom name). |
 | **`compare`**| `cargo run --release -- compare [checkpoint_dir]`| **Numerical parity**: Validates GPU vs CPU mathematical parity on standard benchmark FEN positions. |
 | **`scratch`**| `cargo run --release -- scratch [out.bin]` | Generates positive-bias scratch weights for initialization. |
 | **`info`** | `cargo run --release -- info` | Displays neural network architecture specifications and memory layouts. |
@@ -100,16 +127,16 @@ The trainer provides a clean, single-word command interface:
 
 ## 📁 Standardized Project Layout
 
-Paths are permanently standardized to keep the workflow clean and simple:
-
 ```text
 KittyEngineTrainer/
-├── config.yaml          # Active training configuration & hyperparameters
+├── config.yaml          # Active training configuration & SPRT settings
 ├── data/                # Standardized training datasets (*.binpack)
 ├── checkpoints/         # Checkpoints, champion weights, & playtest weight library
 │   ├── champion_weights.bin     # Active benchmark champion
-│   ├── baseline.json            # Champion metric record
-│   ├── training_history.json    # Full step-by-step training telemetry log
+│   ├── baseline.json            # Champion metric record & SPRT telemetry
+│   ├── training_history.json    # Step-by-step training & SPRT history log
+│   ├── sprt_matches.log         # Human-readable SPRT match & promotion audit
+│   ├── sprt_games.pgn           # Complete PGN game replay archive
 │   ├── kitty_bullet_screlu-*/   # Bullet GPU checkpoints for seamless resuming
 │   └── weights_step_*.bin       # Preserved tournament weights for playtesting
 ├── src/
