@@ -7,6 +7,86 @@ pub const CHECKPOINTS_DIR: &str = "checkpoints";
 pub const CHAMPION_FILE: &str = "checkpoints/champion_weights.bin";
 pub const SCRATCH_FILE: &str = "checkpoints/scratch_weights_init.bin";
 
+fn default_true() -> bool { true }
+fn default_cutechess_path() -> String { "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe".to_string() }
+fn default_engine_path() -> String { "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe".to_string() }
+fn default_book_path() -> String { "C:/Users/evanh/works/software/cutechess/book/book.bin".to_string() }
+fn default_book_depth() -> usize { 8 }
+fn default_time_control() -> String { "5+0.1".to_string() }
+fn default_concurrency() -> usize { 2 }
+fn default_max_rounds() -> usize { 200 }
+fn default_elo0() -> f64 { 0.0 }
+fn default_elo1() -> f64 { 5.0 }
+fn default_alpha() -> f64 { 0.05 }
+fn default_beta() -> f64 { 0.05 }
+fn default_draw_movenumber() -> usize { 40 }
+fn default_draw_movecount() -> usize { 8 }
+fn default_draw_score() -> i32 { 10 }
+fn default_resign_movecount() -> usize { 4 }
+fn default_resign_score() -> i32 { 550 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SprtConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_cutechess_path")]
+    pub cutechess_path: String,
+    #[serde(default = "default_engine_path")]
+    pub engine_path: String,
+    #[serde(default = "default_book_path")]
+    pub book_path: String,
+    #[serde(default = "default_book_depth")]
+    pub book_depth: usize,
+    #[serde(default = "default_time_control")]
+    pub time_control: String,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: usize,
+    #[serde(default = "default_elo0")]
+    pub elo0: f64,
+    #[serde(default = "default_elo1")]
+    pub elo1: f64,
+    #[serde(default = "default_alpha")]
+    pub alpha: f64,
+    #[serde(default = "default_beta")]
+    pub beta: f64,
+    #[serde(default = "default_draw_movenumber")]
+    pub draw_movenumber: usize,
+    #[serde(default = "default_draw_movecount")]
+    pub draw_movecount: usize,
+    #[serde(default = "default_draw_score")]
+    pub draw_score: i32,
+    #[serde(default = "default_resign_movecount")]
+    pub resign_movecount: usize,
+    #[serde(default = "default_resign_score")]
+    pub resign_score: i32,
+}
+
+impl Default for SprtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            cutechess_path: default_cutechess_path(),
+            engine_path: default_engine_path(),
+            book_path: default_book_path(),
+            book_depth: default_book_depth(),
+            time_control: default_time_control(),
+            concurrency: default_concurrency(),
+            max_rounds: default_max_rounds(),
+            elo0: default_elo0(),
+            elo1: default_elo1(),
+            alpha: default_alpha(),
+            beta: default_beta(),
+            draw_movenumber: default_draw_movenumber(),
+            draw_movecount: default_draw_movecount(),
+            draw_score: default_draw_score(),
+            resign_movecount: default_resign_movecount(),
+            resign_score: default_resign_score(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainerConfig {
     pub superbatches: usize,
@@ -19,6 +99,8 @@ pub struct TrainerConfig {
     pub bias_l0: f32,
     pub bias_l1: f32,
     pub bias_l2: f32,
+    #[serde(default)]
+    pub sprt: SprtConfig,
 }
 
 impl Default for TrainerConfig {
@@ -34,6 +116,7 @@ impl Default for TrainerConfig {
             bias_l0: 0.05,
             bias_l1: 0.35,
             bias_l2: 0.35,
+            sprt: SprtConfig::default(),
         }
     }
 }
@@ -69,6 +152,31 @@ save_interval: 1
 bias_l0: 0.05
 bias_l1: 0.35
 bias_l2: 0.35
+
+# ==============================================================================
+# SPRT (Sequential Probability Ratio Test) Automated Verification
+# ==============================================================================
+# SPRT is the EXCLUSIVE gate for champion promotion.
+# When a checkpoint is reached, an SPRT match is conducted against the active champion.
+# Candidate is promoted ONLY if H1 is accepted (statistically verified stronger).
+sprt:
+  enabled: true
+  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
+  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
+  book_depth: 8
+  time_control: "5+0.1"
+  concurrency: 2
+  max_rounds: 200
+  elo0: 0.0
+  elo1: 5.0
+  alpha: 0.05
+  beta: 0.05
+  draw_movenumber: 40
+  draw_movecount: 8
+  draw_score: 10
+  resign_movecount: 4
+  resign_score: 550
 "#;
 
 impl TrainerConfig {

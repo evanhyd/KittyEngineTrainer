@@ -4,6 +4,7 @@ mod convert;
 mod eval;
 mod diagnostics;
 mod config;
+mod sprt;
 
 use std::env;
 use std::fs;
@@ -37,13 +38,14 @@ fn print_usage() {
     println!("Architecture: (24576 -> 256) x 2 -> 32 -> 32 -> 1 x 8 (KittyEngine Layout)");
     println!();
     println!("CONFIGURATION:");
-    println!("  Training parameters are loaded from 'config.yaml' (or 'config.json').");
+    println!("  Training & SPRT parameters are loaded from 'config.yaml'.");
     println!("  Data is loaded from 'data/' and checkpoints are saved to 'checkpoints/'.");
     println!();
     println!("CORE COMMANDS:");
     println!("  train [OPTIONS]             Start training from scratch (Option B: Positive Bias Init)");
     println!("  resume                      Resume training from the latest checkpoint in 'checkpoints/'");
-    println!("  status                      Display active champion metrics and training progress");
+    println!("  status                      Display active champion metrics, SPRT settings & history");
+    println!("  sprt [cand] [champ]         Run automated Cutechess SPRT match between two weight files");
     println!("  check [weights.bin]         Run comprehensive health checks (Dead Neurons + Inversions)");
     println!("  eval [weights.bin]          Evaluate model metrics across all packs in 'data/'");
     println!("  export [step] [out.bin]     Export checkpoint to KittyEngine binary format (default: weights.bin)");
@@ -60,12 +62,8 @@ fn print_usage() {
     println!();
 }
 
-
-
 fn run_info() {
-
     println!("KittyEngine NNUE Layout Specification:");
-
     println!("  Input Feature Space:   {} (HalfKA Folded, 32 king squares x 768 piece planes)", INPUT_SIZE);
     println!("  Dual Accumulator:      {} per perspective (512 combined)", ACCUM_SIZE);
     println!("  Hidden Layer 1:        512 -> {} (Dense + Activation)", HIDDEN1_SIZE);
@@ -73,59 +71,30 @@ fn run_info() {
     println!("  Output Layer:          32 -> 1 x {} Buckets (Material Count)", NUM_OUTPUT_BUCKETS);
     println!("  Centipawn Scale:       {:.1} cp", SCALE);
     println!("  Target Weight Size:    25,237,864 bytes (NNUESGD6 format)");
-
 }
-
-
 
 fn run_pack_chunks(args: &[String]) {
-
     if args.len() < 4 {
-
         println!("Error: missing arguments for pack-chunks command.");
-
         println!("Usage: cargo run --release -- pack-chunks <input_eval.json> <output_dir> [positions_per_chunk]");
-
         return;
-
     }
-
-
 
     let input_path = Path::new(&args[2]);
-
     let output_dir = Path::new(&args[3]);
-
     let chunk_size = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(DEFAULT_CHUNK_SIZE);
 
-
-
     match convert::convert_json_to_chunked_binpack(input_path, output_dir, "eval_chunk", chunk_size) {
-
         Ok(chunks) => {
-
             println!("Chunking finished successfully! Created {} chunk(s).", chunks.len());
-
         }
-
         Err(e) => {
-
             eprintln!("Failed to chunk dataset: {}", e);
-
         }
-
     }
-
 }
 
-
-
 fn run_export(args: &[String]) {
-    // Syntax:
-    //   cargo run --release -- export                     (exports champion or latest checkpoint to weights.bin)
-    //   cargo run --release -- export <step>              (exports step N checkpoint to weights_step_N.bin)
-    //   cargo run --release -- export <step> <out.bin>    (exports step N checkpoint to specified file)
-    //   cargo run --release -- export <raw.bin> <out.bin> (converts raw.bin to specified file)
     let target_step_or_path = args.get(2).map(|s| s.as_str());
     let custom_out = args.get(3).map(PathBuf::from);
 
@@ -175,6 +144,40 @@ fn run_export(args: &[String]) {
     }
 }
 
+fn run_sprt(args: &[String]) {
+    let cfg = TrainerConfig::load_or_default();
+    let default_champ = PathBuf::from(CHAMPION_FILE);
+    let default_cand = if let Some((step, _)) = config::detect_latest_checkpoint() {
+        let p = PathBuf::from(format!("checkpoints/weights_step_{}.bin", step));
+        if p.exists() { p } else { default_champ.clone() }
+    } else {
+        default_champ.clone()
+    };
+
+    let cand_path = args.get(2).map(PathBuf::from).unwrap_or(default_cand);
+    let champ_path = args.get(3).map(PathBuf::from).unwrap_or(default_champ);
+
+    if !cand_path.exists() {
+        eprintln!("Error: Candidate weights file '{}' not found.", cand_path.display());
+        return;
+    }
+    if !champ_path.exists() {
+        eprintln!("Error: Champion weights file '{}' not found.", champ_path.display());
+        return;
+    }
+
+    match sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path) {
+        Ok(res) => {
+            if res.decision == sprt::SprtDecision::AcceptedH1 {
+                println!("Candidate statistically verified superior to Champion under SPRT.");
+            }
+        }
+        Err(e) => {
+            eprintln!("SPRT execution failed: {}", e);
+        }
+    }
+}
+
 fn run_status() {
     let cfg = TrainerConfig::load_or_default();
     let baseline_path = Path::new("checkpoints/baseline.json");
@@ -190,6 +193,16 @@ fn run_status() {
     println!("  - Batch Size:          {} positions", cfg.batch_size);
     println!("  - Checkpoint Save:     Every {} superbatch(es) (permanent playtest export)", cfg.save_interval);
     println!("  - Positive Biases:     L0={:.2}, L1={:.2}, L2={:.2}", cfg.bias_l0, cfg.bias_l1, cfg.bias_l2);
+    println!();
+    println!("⚔️ SPRT VERIFICATION SETTINGS:");
+    println!("  - SPRT Enabled:        {}", cfg.sprt.enabled);
+    println!("  - Cutechess CLI:       {}", cfg.sprt.cutechess_path);
+    println!("  - Engine Executable:   {}", cfg.sprt.engine_path);
+    println!("  - Time Control:        {}", cfg.sprt.time_control);
+    println!("  - Concurrency:         {} threads", cfg.sprt.concurrency);
+    println!("  - Max Rounds:          {}", cfg.sprt.max_rounds);
+    println!("  - SPRT Bounds:         Elo [{}, {}] (alpha={}, beta={})",
+        cfg.sprt.elo0, cfg.sprt.elo1, cfg.sprt.alpha, cfg.sprt.beta);
     println!();
 
     if baseline_path.exists() {
@@ -217,6 +230,18 @@ fn run_status() {
                 println!("  - Mate MAE:         {:.7}", mate_mae);
                 println!("  - Non-Mate MAE:     {:.7}", non_mate_mae);
                 println!("  - Validation Pos:   {} (across dataset packs)", pos);
+
+                if let Some(sprt_obj) = v.get("sprt") {
+                    let w = sprt_obj.get("wins").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let l = sprt_obj.get("losses").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let d = sprt_obj.get("draws").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let elo = sprt_obj.get("elo_diff").and_then(|x| x.as_f64());
+                    let err = sprt_obj.get("elo_error").and_then(|x| x.as_f64());
+                    println!("  - SPRT Verification: Defeated Prior Champ (+{} -{} ={})", w, l, d);
+                    if let Some(e) = elo {
+                        println!("  - SPRT Elo Advantage: {:+.1} +/- {:.1}", e, err.unwrap_or(0.0));
+                    }
+                }
             }
         }
     } else {
@@ -322,8 +347,6 @@ fn run_import(args: &[String]) {
         }
     }
 }
-
-
 
 fn run_train(args: &[String], is_resume: bool) {
     let cfg = TrainerConfig::load_or_default();
@@ -460,147 +483,75 @@ fn run_train(args: &[String], is_resume: bool) {
         i += 1;
     }
 
-
-
     if target_dir_or_file.is_empty() {
-
         eprintln!("Error: no data path specified.");
-
         return;
-
     }
-
-
 
     let target_path = Path::new(&target_dir_or_file);
-
     let mut data_files: Vec<PathBuf> = Vec::new();
 
-
-
     if target_path.is_dir() {
-
         if let Ok(entries) = fs::read_dir(target_path) {
-
             for entry in entries.flatten() {
-
                 let path = entry.path();
-
                 if path.extension().and_then(|s| s.to_str()) == Some("binpack") {
-
                     data_files.push(path);
-
                 }
-
             }
-
         }
-
         data_files.sort();
-
     } else if target_path.exists() {
-
         data_files.push(target_path.to_path_buf());
-
     } else {
-
         eprintln!("Error: target path '{}' does not exist.", target_path.display());
-
         return;
-
     }
-
-
 
     if data_files.is_empty() {
-
         eprintln!("Error: no .binpack files found in '{}'.", target_path.display());
-
         return;
-
     }
-
-
 
     let total_packs = data_files.len();
-
     let mut train_files = data_files.clone();
-
     if train_files.len() == 9 {
-
         train_files = vec![
-
-            data_files[0].clone(), // eval_chunk_001.binpack (50M pos, standard)
-
-            data_files[1].clone(), // eval_chunk_002.binpack (50M pos, standard)
-
-            data_files[7].clone(), // eval_chunk_008.binpack (50M pos, heavy tactics/mates)
-
-            data_files[2].clone(), // eval_chunk_003.binpack (50M pos, standard)
-
-            data_files[3].clone(), // eval_chunk_004.binpack (50M pos, standard)
-
-            data_files[8].clone(), // eval_chunk_009.binpack (16.37M pos, heavy tactics/mates)
-
-            data_files[4].clone(), // eval_chunk_005.binpack (50M pos, standard)
-
-            data_files[5].clone(), // eval_chunk_006.binpack (50M pos, standard)
-
-            data_files[6].clone(), // eval_chunk_007.binpack (50M pos, standard)
-
+            data_files[0].clone(),
+            data_files[1].clone(),
+            data_files[7].clone(),
+            data_files[2].clone(),
+            data_files[3].clone(),
+            data_files[8].clone(),
+            data_files[4].clone(),
+            data_files[5].clone(),
+            data_files[6].clone(),
         ];
-
     }
-
-
 
     let total_positions: usize = train_files
-
         .iter()
-
         .map(|f| fs::metadata(f).map(|m| (m.len() / 32) as usize).unwrap_or(0))
-
         .sum();
-
     let total_dataset_batches = (total_positions / batch_size).max(1);
-
     let batches_per_superbatch = user_batches_per_sb.unwrap_or((total_dataset_batches / 9).max(1));
-
     let positions_per_superbatch = batches_per_superbatch * batch_size;
 
-
-
     println!("Initializing Bullet ValueTrainer for KittyEngine layout (Strategy 1: Global Unified Stream)...");
-
     println!("  Unified training dataset stream ({} files, {} positions, {} total batches):",
-
         train_files.len(), total_positions, total_dataset_batches);
-
     for (idx, f) in train_files.iter().enumerate() {
-
         let p_size = fs::metadata(f).map(|m| (m.len() / 32) as usize).unwrap_or(0);
-
         println!("    [{}] {} ({} pos)", idx + 1, f.display(), p_size);
-
     }
-
     println!("  Activation:       SCReLU");
-
     println!("  Batch Size:       {}", batch_size);
-
     println!("  Superbatch size:  {} batches ({} pos, ~{:.1} superbatches/epoch)",
-
         batches_per_superbatch, positions_per_superbatch, total_dataset_batches as f64 / batches_per_superbatch as f64);
-
     println!("  Superbatch steps: {}..{}", start_superbatch, superbatches);
-
     println!("  Eval per pack:    {} pos across ALL {} packs ({} total pos)",
-
         eval_positions_per_pack, total_packs, total_packs * eval_positions_per_pack);
-
     println!("  WDL lambda:       {:.2} (score distillation)", wdl_val);
-
-
 
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
@@ -633,56 +584,31 @@ fn run_train(args: &[String], is_resume: bool) {
             l3.forward(h2).select(output_buckets)
         });
 
-
-
     if let Some(ref w_path) = weights_path {
-
         let p = Path::new(w_path);
-
         if !p.exists() {
-
             eprintln!("Error: initial weights file '{}' not found.", p.display());
-
             return;
-
         }
 
         if p.is_dir() {
-
             println!("Resuming Bullet training from checkpoint directory {}...", p.display());
-
             trainer.load_from_checkpoint(p.to_str().unwrap());
-
         } else {
-
             let init_bullet_path = Path::new("checkpoints/init_bullet_weights.bin");
-
             println!("Converting KittyEngine weights from {}...", p.display());
-
             if let Err(e) = export::import_from_kitty_weights(p, init_bullet_path) {
-
                 eprintln!("Failed to import KittyEngine weights: {}", e);
-
                 return;
-
             }
-
-
 
             println!("Loading initial weights into GPU VRAM...");
-
             if let Err(e) = trainer.optimiser.load_weights_from_file(init_bullet_path.to_str().unwrap()) {
-
                 eprintln!("Failed to load weights into trainer: {:?}", e);
-
                 return;
-
             }
-
         }
-
         println!("Successfully loaded existing weights into trainer!");
-
     } else {
         println!("Option B: Initializing brand-new weights from scratch with positive bias initialization...");
         let scratch_kitty_path = Path::new(SCRATCH_FILE);
@@ -706,276 +632,93 @@ fn run_train(args: &[String], is_resume: bool) {
         println!("Scratch weights successfully loaded into GPU VRAM! Positive biases active on all hidden layers.");
     }
 
-
-
     trainer.optimiser.set_params(AdamWParams {
-
         decay: 0.01,
-
         beta1: 0.9,
-
         beta2: 0.999,
-
         min_weight: -1.98,
-
         max_weight: 1.98,
-
     });
 
-
-
     let max_lr = user_lr.unwrap_or(if weights_path.is_some() && !is_resume { 0.000015 } else { cfg.lr });
-
     let min_lr = user_min_lr.unwrap_or(cfg.min_lr);
-
     println!("  Learning Rate:    {} (peak) -> {} (min) [Cosine Annealing Decay]", max_lr, min_lr);
 
-
-
     let net_id = "kitty_bullet_screlu".to_string();
-
-
-
     let settings = LocalSettings {
-
         threads: 8,
-
         test_set: None,
-
         output_directory: "checkpoints",
-
         batch_queue_size: 64,
-
     };
 
-
-
     let baseline_path = Path::new("checkpoints/baseline.json");
-
     let mut baseline_mae = f64::MAX;
-
     let mut baseline_smse = f64::MAX;
-    let mut baseline_wdl: Option<f32> = None;
-    let mut baseline_step: usize = 0;
-    let mut baseline_positions: Option<usize> = None;
 
     if baseline_path.exists() {
         if let Ok(content) = fs::read_to_string(baseline_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                 baseline_mae = v.get("mae").and_then(|x| x.as_f64()).unwrap_or(f64::MAX);
                 baseline_smse = v.get("smse").and_then(|x| x.as_f64()).unwrap_or(f64::MAX);
-                baseline_wdl = v.get("wdl").and_then(|x| x.as_f64()).map(|x| x as f32);
-                baseline_step = v.get("step").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
-                baseline_positions = v.get("positions").and_then(|x| x.as_u64()).map(|x| x as usize);
             }
         }
     }
-
-    let target_eval_positions = total_packs * eval_positions_per_pack;
-    let need_baseline_eval = !baseline_path.exists()
-        || baseline_mae == f64::MAX
-        || baseline_wdl.map(|w| (w - wdl_val).abs() > 1e-4).unwrap_or(true)
-        || baseline_positions.map(|p| p != target_eval_positions).unwrap_or(true);
-
-
-
-    let eval_weights_file: Option<PathBuf> = if let Some(ref w_path) = weights_path {
-        let p = Path::new(w_path);
-        if p.is_file() {
-            Some(p.to_path_buf())
-        } else if p.is_dir() {
-            let champ = Path::new("checkpoints/champion_weights.bin");
-            if champ.exists() {
-                Some(champ.to_path_buf())
-            } else {
-                let raw = p.join("raw.bin");
-                let exported = Path::new("checkpoints/champion_weights.bin");
-                if raw.exists() && export::export_from_raw_checkpoint(&raw, exported).is_ok() {
-                    Some(exported.to_path_buf())
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        let scratch_kitty = Path::new("checkpoints/scratch_weights_init.bin");
-        if scratch_kitty.exists() {
-            Some(scratch_kitty.to_path_buf())
-        } else {
-            None
-        }
-    };
-
-    if let Some(ref eval_file) = eval_weights_file {
-        if need_baseline_eval {
-            println!("\nEvaluating initial weights under WDL={:.2} across ALL {} packs to establish baseline...", wdl_val, total_packs);
-            if let Ok((b_overall, b_non_mate, b_mate)) = eval::evaluate_checkpoint_packs(eval_file, &data_files, eval_positions_per_pack, wdl_val) {
-                baseline_mae = b_overall.mae();
-                baseline_smse = b_overall.smse();
-                let champion_bin = "checkpoints/champion_weights.bin";
-                if eval_file != Path::new(champion_bin) {
-                    let _ = fs::copy(eval_file, champion_bin);
-                }
-                let initial_record = serde_json::json!({
-                    "step": if baseline_step > 0 { baseline_step } else if weights_path.is_some() { 86 } else { 0 },
-                    "pack": format!("champion_step_{}", if baseline_step > 0 { baseline_step } else { 86 }),
-                    "epoch": (baseline_step * batches_per_superbatch) / total_dataset_batches.max(1),
-                    "wdl": wdl_val,
-                    "mae": baseline_mae,
-                    "smse": baseline_smse,
-                    "mse": b_overall.mse(),
-                    "rmse": b_overall.rmse(),
-                    "non_mate_mae": b_non_mate.mae(),
-                    "non_mate_smse": b_non_mate.smse(),
-                    "mate_mae": b_mate.mae(),
-                    "mate_smse": b_mate.smse(),
-                    "positions": b_overall.count,
-                    "weights_file": champion_bin,
-                });
-                if let Ok(json_str) = serde_json::to_string_pretty(&initial_record) {
-                    let _ = fs::write(baseline_path, json_str);
-                }
-            }
-        }
-    }
-
-
-
-    println!("\n================================================================================");
-
-    println!("👑 ACTIVE BASELINE CHAMPION (BENCHMARK TO BEAT BEFORE TRAINING):");
-
-    if baseline_mae < f64::MAX && baseline_smse < f64::MAX {
-
-        println!("  Baseline Overall MAE:  {:.7} (WDL={:.2})", baseline_mae, wdl_val);
-
-        println!("  Baseline Overall SMSE: {:.7}", baseline_smse);
-
-        println!("  Promotion Policy:      Normalized Composite Score");
-
-        println!("    - Target:            0.5 * (MAE / {:.7}) + 0.5 * (SMSE / {:.7}) < 1.00000", baseline_mae, baseline_smse);
-
-        println!("    - Safety bounds:     MAE <= {:.7} (+1.5%), SMSE <= {:.7} (+1.5%)", baseline_mae * 1.015, baseline_smse * 1.015);
-
-    } else {
-
-        println!("  Baseline: None established yet (first pack will set initial baseline)");
-
-    }
-
-    println!("================================================================================");
-
-
 
     let pack_strs: Vec<String> = train_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
-
     let pack_refs: Vec<&str> = pack_strs.iter().map(|s| s.as_str()).collect();
-
     let data_loader = loader::DirectSequentialDataLoader::new(&pack_refs);
 
-
-
-    println!("\nStarting GPU training across global unified dataset with automated evaluation after every superbatch...");
-
-
+    println!("\nStarting GPU training across global unified dataset with automated SPRT verification...");
 
     for step in start_superbatch..=superbatches {
-
         let global_batch_start = (step - 1) * batches_per_superbatch;
-
         let epoch = global_batch_start / total_dataset_batches + 1;
-
         let epoch_progress_pos = (global_batch_start * batch_size) % total_positions;
-
         let epoch_progress_pct = (epoch_progress_pos as f64 / total_positions as f64) * 100.0;
 
-
-
         println!("\n================================================================================");
-
         println!("▶ [SUPERBATCH {}/{}] Epoch {} ({:.1}% of epoch) | {} batches ({} pos) | Global Batches {}..{}",
-
             step, superbatches, epoch, epoch_progress_pct, batches_per_superbatch, positions_per_superbatch,
-
             global_batch_start, global_batch_start + batches_per_superbatch
-
         );
-
         println!("================================================================================");
 
-
-
         let cycle_start = schedule_start.unwrap_or(start_superbatch);
-
         let progress = if superbatches > cycle_start {
-
             (step - cycle_start) as f32 / (superbatches - cycle_start) as f32
-
         } else {
-
             0.0
-
         };
-
         let step_lr = min_lr + 0.5 * (max_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos());
-
         println!("  Active Learning Rate: {:.7} (Cosine Annealing: {:.1}% progress)", step_lr, progress * 100.0);
 
-
-
         let schedule = TrainingSchedule {
-
             net_id: net_id.clone(),
-
             eval_scale: SCALE,
-
             steps: TrainingSteps {
-
                 batch_size,
-
                 batches_per_superbatch,
-
                 start_superbatch: step,
-
                 end_superbatch: step,
-
             },
-
             wdl_scheduler: wdl::ConstantWDL { value: wdl_val },
-
             lr_scheduler: lr::ConstantLR { value: step_lr },
-
             save_rate: 1,
-
         };
-
-
 
         trainer.run(&schedule, &settings, &data_loader);
 
-
-
         let checkpoint_dir = format!("checkpoints/{net_id}-{step}");
-
         let raw_path = format!("{checkpoint_dir}/raw.bin");
-
         let exported_bin = format!("checkpoints/weights_screlu_step{step}.bin");
         let periodic_bin = format!("checkpoints/weights_step_{step}.bin");
 
-
-
         if Path::new(&raw_path).exists() {
-
             println!("\nExporting step {} checkpoint to {}...", step, exported_bin);
-
             if let Err(e) = export::export_from_raw_checkpoint(Path::new(&raw_path), Path::new(&exported_bin)) {
-
                 eprintln!("Failed to export weights for step {}: {}", step, e);
-
                 continue;
-
             }
 
             let is_save_interval = step % save_interval == 0;
@@ -984,239 +727,115 @@ fn run_train(args: &[String], is_resume: bool) {
                 println!("💾 Preserved tournament checkpoint: {}", periodic_bin);
             }
 
-
-
             println!("\nEvaluating checkpoint across ALL {} packs ({} pos/pack)...", total_packs, eval_positions_per_pack);
-
             match eval::evaluate_checkpoint_packs(Path::new(&exported_bin), &data_files, eval_positions_per_pack, wdl_val) {
-
                 Ok((overall, non_mate, mate)) => {
+                    let diff_mae_str = if baseline_mae < f64::MAX {
+                        format!(" ({:+.7} vs champion)", overall.mae() - baseline_mae)
+                    } else {
+                        String::new()
+                    };
+                    let diff_smse_str = if baseline_smse < f64::MAX {
+                        format!(" ({:+.7} vs champion)", overall.smse() - baseline_smse)
+                    } else {
+                        String::new()
+                    };
 
                     println!("\n================================================================================");
-
                     println!("Evaluation Results across ALL {} packs ({} positions):", total_packs, overall.count);
-
-                    let diff_mae = if baseline_mae < f64::MAX {
-
-                        format!(" ({:+.7} vs baseline)", overall.mae() - baseline_mae)
-
-                    } else {
-
-                        String::new()
-
-                    };
-
-                    let diff_smse = if baseline_smse < f64::MAX {
-
-                        format!(" ({:+.7} vs baseline)", overall.smse() - baseline_smse)
-
-                    } else {
-
-                        String::new()
-
-                    };
-
                     println!(
-
                         "  Overall:   MAE = {:.7}{}  |  SMSE = {:.7}{}  |  BCE = {:.7}  |  MSE = {:.7}  |  RMSE = {:.7}",
-
-                        overall.mae(), diff_mae, overall.smse(), diff_smse, overall.bce(), overall.mse(), overall.rmse()
-
+                        overall.mae(), diff_mae_str, overall.smse(), diff_smse_str, overall.bce(), overall.mse(), overall.rmse()
                     );
-
                     println!(
-
                         "  Non-mate:  MAE = {:.7}  |  SMSE = {:.7}  |  MSE = {:.7}  ({} pos)",
-
                         non_mate.mae(), non_mate.smse(), non_mate.mse(), non_mate.count
-
                     );
-
                     println!(
-
                         "  Mate:      MAE = {:.7}  |  SMSE = {:.7}  |  MSE = {:.7}  ({} pos)",
-
                         mate.mae(), mate.smse(), mate.mse(), mate.count
-
                     );
-
                     println!("================================================================================");
 
-
-
-                    let (b_mae, b_smse) = if baseline_path.exists() {
-
-                        if let Ok(content) = fs::read_to_string(baseline_path) {
-
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-
-                                let m = v.get("mae").and_then(|x| x.as_f64()).unwrap_or(baseline_mae);
-
-                                let s = v.get("smse").and_then(|x| x.as_f64()).unwrap_or(baseline_smse);
-
-                                (m, s)
-
-                            } else {
-
-                                (baseline_mae, baseline_smse)
-
-                            }
-
-                        } else {
-
-                            (baseline_mae, baseline_smse)
-
-                        }
-
-                    } else {
-
-                        (baseline_mae, baseline_smse)
-
-                    };
-
-                    baseline_mae = b_mae;
-
-                    baseline_smse = b_smse;
-
-
-
-                    let composite = if baseline_mae < f64::MAX && baseline_smse < f64::MAX {
-
-                        0.5 * (overall.mae() / baseline_mae) + 0.5 * (overall.smse() / baseline_smse)
-
-                    } else {
-
-                        0.0
-
-                    };
-
-
-
-                    let qualifies = if baseline_smse == f64::MAX || baseline_mae == f64::MAX {
-
-                        true
-
-                    } else {
-
-                        // Composite improvement, with a safety cap preventing >1.5% degradation in either metric
-
-                        composite < 1.0 && overall.mae() <= baseline_mae * 1.015 && overall.smse() <= baseline_smse * 1.015
-
-                    };
-
-
-
-                    if qualifies {
-
-                        println!("\n🏆 NEW ALL-TIME CHAMPION PROMOTED TO BASELINE!");
-
-                        if baseline_smse == f64::MAX || baseline_mae == f64::MAX {
-
-                            println!("  Reason: Initial baseline established.");
-
-                        } else {
-
-                            let mae_pct = ((overall.mae() / baseline_mae) - 1.0) * 100.0;
-
-                            let smse_pct = ((overall.smse() / baseline_smse) - 1.0) * 100.0;
-
-                            let comp_pct = (composite - 1.0) * 100.0;
-
-                            println!("  Reason: Normalized Composite Score improved to {:.5} ({:+.2}% net improvement)", composite, comp_pct);
-
-                            println!("    - MAE:  {:.7} -> {:.7} ({:+.2}%)", baseline_mae, overall.mae(), mae_pct);
-
-                            println!("    - SMSE: {:.7} -> {:.7} ({:+.2}%)", baseline_smse, overall.smse(), smse_pct);
-
-                            println!("    - BCE:  {:.7} (Validation Log-Loss)", overall.bce());
-
-                        }
-
-                        println!("  Previous Baseline: MAE={:.7}, SMSE={:.7}", baseline_mae, baseline_smse);
-
-                        println!("  New Baseline:      MAE={:.7}, SMSE={:.7}", overall.mae(), overall.smse());
-
+                    // SPRT Promotion Policy: SPRT is the EXCLUSIVE gate for champion promotion
+                    let champion_file = Path::new(CHAMPION_FILE);
+                    let (promoted, sprt_stats) = if !champion_file.exists() {
+                        println!("\n👑 INITIAL BASELINE CHAMPION ESTABLISHED!");
+                        println!("  Reason: No prior champion existed. Step {} registered as baseline champion.", step);
+                        let _ = fs::copy(&exported_bin, CHAMPION_FILE);
                         baseline_mae = overall.mae();
-
                         baseline_smse = overall.smse();
-
-
-
-                        let champion_bin = CHAMPION_FILE;
-
-                        let _ = fs::copy(&exported_bin, champion_bin);
-
-
-
-                        let new_record = serde_json::json!({
-
-                            "step": step,
-
-                            "pack": format!("unified_epoch_{}_step_{}", epoch, step),
-
-                            "epoch": epoch,
-
-                            "wdl": wdl_val,
-
-                            "composite": composite,
-
-                            "mae": overall.mae(),
-
-                            "smse": overall.smse(),
-
-                            "bce": overall.bce(),
-
-                            "mse": overall.mse(),
-
-                            "rmse": overall.rmse(),
-
-                            "non_mate_mae": non_mate.mae(),
-
-                            "non_mate_smse": non_mate.smse(),
-
-                            "mate_mae": mate.mae(),
-
-                            "mate_smse": mate.smse(),
-
-                            "positions": overall.count,
-
-                            "weights_file": champion_bin,
-
-                        });
-
-                        if let Ok(json_str) = serde_json::to_string_pretty(&new_record) {
-
-                            let _ = fs::write(baseline_path, json_str);
-
-                            println!("  Updated baseline record: {}", baseline_path.display());
-
+                        (true, None)
+                    } else if cfg.sprt.enabled {
+                        println!("\n⚔️ RUNNING AUTOMATED SPRT PROMOTION MATCH (Candidate Step {} vs Active Champion)...", step);
+                        match sprt::run_sprt_match(&cfg.sprt, Path::new(&exported_bin), champion_file) {
+                            Ok(res) => {
+                                let passed = res.decision == sprt::SprtDecision::AcceptedH1;
+                                if passed {
+                                    println!("\n🏆 NEW ALL-TIME CHAMPION PROMOTED VIA SPRT!");
+                                    println!("  Candidate defeated Champion: +{} -{} ={} (Elo {:+.1} +/- {:.1})",
+                                        res.wins, res.losses, res.draws,
+                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0));
+                                    let _ = fs::copy(&exported_bin, CHAMPION_FILE);
+                                    baseline_mae = overall.mae();
+                                    baseline_smse = overall.smse();
+                                } else {
+                                    println!("\n❌ Step {} did not beat active Champion under SPRT.", step);
+                                    println!("  Score: Candidate +{} -{} ={}", res.wins, res.losses, res.draws);
+                                    if !is_save_interval {
+                                        let _ = fs::remove_file(&exported_bin);
+                                    }
+                                }
+                                (passed, Some(res))
+                            }
+                            Err(e) => {
+                                eprintln!("[sprt] SPRT execution error: {}", e);
+                                if !is_save_interval {
+                                    let _ = fs::remove_file(&exported_bin);
+                                }
+                                (false, None)
+                            }
                         }
-
-
-
-                        // Checkpoint library is permanently preserved for engine playtesting tournaments.
-
                     } else {
+                        println!("\n⚠️ SPRT is disabled in config.yaml. Checkpoint preserved, but champion remains unchanged.");
+                        println!("   (SPRT is the exclusive gate for champion promotion).");
+                        (false, None)
+                    };
 
-                        let mae_pct = if baseline_mae < f64::MAX { ((overall.mae() / baseline_mae) - 1.0) * 100.0 } else { 0.0 };
-
-                        let smse_pct = if baseline_smse < f64::MAX { ((overall.smse() / baseline_smse) - 1.0) * 100.0 } else { 0.0 };
-
-                        println!("\nDid not beat active baseline champion under Normalized Composite Promotion Rule.");
-
-                        println!("  Composite Score: {:.5} (Target: < 1.00000)", composite);
-
-                        println!("  Current:   MAE={:.7} ({:+.2}%), SMSE={:.7} ({:+.2}%), BCE={:.7}", overall.mae(), mae_pct, overall.smse(), smse_pct, overall.bce());
-
-                        println!("  Baseline:  MAE={:.7}, SMSE={:.7}", baseline_mae, baseline_smse);
-
-                        // If not on save_interval, clean up the temporary exported_bin to save disk space
-                        if !is_save_interval {
-
-                            let _ = fs::remove_file(&exported_bin);
-
+                    if promoted {
+                        let mut rec = serde_json::json!({
+                            "step": step,
+                            "pack": format!("unified_epoch_{}_step_{}", epoch, step),
+                            "epoch": epoch,
+                            "wdl": wdl_val,
+                            "mae": overall.mae(),
+                            "smse": overall.smse(),
+                            "bce": overall.bce(),
+                            "mse": overall.mse(),
+                            "rmse": overall.rmse(),
+                            "non_mate_mae": non_mate.mae(),
+                            "non_mate_smse": non_mate.smse(),
+                            "mate_mae": mate.mae(),
+                            "mate_smse": mate.smse(),
+                            "positions": overall.count,
+                            "weights_file": CHAMPION_FILE,
+                        });
+                        if let Some(ref s) = sprt_stats {
+                            rec["sprt"] = serde_json::json!({
+                                "decision": format!("{:?}", s.decision),
+                                "wins": s.wins,
+                                "losses": s.losses,
+                                "draws": s.draws,
+                                "total_games": s.total_games,
+                                "elo_diff": s.elo_diff,
+                                "elo_error": s.elo_error,
+                                "llr": s.llr,
+                            });
                         }
-
+                        if let Ok(json_str) = serde_json::to_string_pretty(&rec) {
+                            let _ = fs::write(baseline_path, json_str);
+                            println!("  Updated baseline record: {}", baseline_path.display());
+                        }
                     }
 
                     record_training_history(
@@ -1229,26 +848,17 @@ fn run_train(args: &[String], is_resume: bool) {
                         overall.mse(),
                         mate.mae(),
                         non_mate.mae(),
-                        qualifies,
+                        promoted,
+                        sprt_stats.as_ref(),
                     );
-
                 }
-
                 Err(e) => {
-
                     eprintln!("Evaluation failed for step {}: {}", step, e);
-
                 }
-
             }
-
         }
-
     }
-
 }
-
-
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct HistoryEntry {
@@ -1262,6 +872,14 @@ struct HistoryEntry {
     mate_mae: f64,
     non_mate_mae: f64,
     promoted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sprt_wins: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sprt_losses: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sprt_draws: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sprt_elo: Option<f64>,
 }
 
 fn record_training_history(
@@ -1275,6 +893,7 @@ fn record_training_history(
     mate_mae: f64,
     non_mate_mae: f64,
     promoted: bool,
+    sprt_res: Option<&sprt::SprtMatchResult>,
 ) {
     let history_path = Path::new("checkpoints/training_history.json");
     let mut history: Vec<HistoryEntry> = if history_path.exists() {
@@ -1298,6 +917,10 @@ fn record_training_history(
         mate_mae,
         non_mate_mae,
         promoted,
+        sprt_wins: sprt_res.map(|s| s.wins),
+        sprt_losses: sprt_res.map(|s| s.losses),
+        sprt_draws: sprt_res.map(|s| s.draws),
+        sprt_elo: sprt_res.and_then(|s| s.elo_diff),
     });
     history.sort_by_key(|h| h.step);
 
@@ -1319,161 +942,73 @@ fn run_eval(args: &[String]) {
         return;
     }
 
-
-
     let mut pack_paths: Vec<PathBuf> = Vec::new();
-
     if target_data.is_dir() {
-
         if let Ok(entries) = fs::read_dir(target_data) {
-
             for entry in entries.flatten() {
-
                 let p = entry.path();
-
                 if p.extension().and_then(|s| s.to_str()) == Some("binpack") {
-
                     pack_paths.push(p);
-
                 }
-
             }
-
         }
-
         pack_paths.sort();
-
     } else if target_data.exists() {
-
         pack_paths.push(target_data.to_path_buf());
-
     }
-
-
 
     if pack_paths.is_empty() {
-
         eprintln!("Error: no .binpack files found in '{}'.", target_data.display());
-
         return;
-
     }
-
-
 
     let mut wdl_val: f32 = 0.20;
-
     for (idx, a) in args.iter().enumerate() {
-
         if a == "--wdl" && idx + 1 < args.len() {
-
             if let Ok(v) = args[idx + 1].parse::<f32>() {
-
                 wdl_val = v;
-
             }
-
         }
-
     }
-
-
 
     println!("Starting Benchmark Evaluation across ALL {} pack(s):", pack_paths.len());
-
     println!("  Weights File:        {}", weights_path.display());
-
     println!("  Positions per pack:  {}", positions_per_pack);
-
     println!("  Total Est Positions: {}", pack_paths.len() * positions_per_pack);
-
     println!("  Activation:          SCReLU (NNUESGD6)");
-
     println!("  WDL lambda:          {:.2}", wdl_val);
 
-
-
     let start = std::time::Instant::now();
-
     match eval::evaluate_checkpoint_packs(weights_path, &pack_paths, positions_per_pack, wdl_val) {
-
         Ok((overall, non_mate, mate)) => {
-
             let elapsed = start.elapsed();
-
             println!("\n================================================================================");
-
             println!(
-
                 "Evaluation Results across ALL {} packs ({} positions in {:.2}s, {:.0} pos/sec):",
-
                 pack_paths.len(),
-
                 overall.count,
-
                 elapsed.as_secs_f64(),
-
                 overall.count as f64 / elapsed.as_secs_f64()
-
             );
-
             println!(
-
                 "  Overall:   MAE = {:.7}  |  SMSE = {:.7}  |  MSE = {:.7}  |  RMSE = {:.7}",
-
-                overall.mae(),
-
-                overall.smse(),
-
-                overall.mse(),
-
-                overall.rmse()
-
+                overall.mae(), overall.smse(), overall.mse(), overall.rmse()
             );
-
             println!(
-
                 "  Non-mate:  MAE = {:.7}  |  SMSE = {:.7}  |  MSE = {:.7}  ({} pos)",
-
-                non_mate.mae(),
-
-                non_mate.smse(),
-
-                non_mate.mse(),
-
-                non_mate.count
-
+                non_mate.mae(), non_mate.smse(), non_mate.mse(), non_mate.count
             );
-
             println!(
-
                 "  Mate:      MAE = {:.7}  |  SMSE = {:.7}  |  MSE = {:.7}  ({} pos)",
-
-                mate.mae(),
-
-                mate.smse(),
-
-                mate.mse(),
-
-                mate.count
-
+                mate.mae(), mate.smse(), mate.mse(), mate.count
             );
-
             println!("================================================================================");
-
         }
-
         Err(e) => {
-
             eprintln!("Evaluation failed: {}", e);
-
         }
-
     }
-
 }
-
-
 
 fn run_inversions(args: &[String]) {
     let default_weights = PathBuf::from(CHAMPION_FILE);
@@ -1484,215 +1019,109 @@ fn run_inversions(args: &[String]) {
         .and_then(|s| if s == "all" { Some(0) } else { s.parse().ok() })
         .unwrap_or(2_000_000);
 
-
-
     if !weights_path.exists() {
-
         eprintln!("Error: weights file '{}' not found.", weights_path.display());
-
         return;
-
     }
-
-
 
     let mut pack_paths: Vec<PathBuf> = Vec::new();
-
     if target_data.is_dir() {
-
         if let Ok(entries) = fs::read_dir(target_data) {
-
             for entry in entries.flatten() {
-
                 let p = entry.path();
-
                 if p.extension().and_then(|s| s.to_str()) == Some("binpack") {
-
                     pack_paths.push(p);
-
                 }
-
             }
-
         }
-
         pack_paths.sort();
-
     } else if target_data.exists() {
-
         pack_paths.push(target_data.to_path_buf());
-
     }
-
-
 
     if pack_paths.is_empty() {
-
         eprintln!("Error: no .binpack files found in '{}'.", target_data.display());
-
         return;
-
     }
 
-
-
     println!("================================================================================");
-
     println!("NNUE High-CP Evaluation Inversion & Sign Disagreement Analysis");
-
     println!("================================================================================");
-
     println!("  Weights File:          {}", weights_path.display());
-
     println!("  Packs Analyzed:        {}", pack_paths.len());
-
     if positions_per_pack == 0 {
-
         println!("  Positions per pack:    ALL available positions");
-
     } else {
-
         println!("  Positions per pack:    {} (Target Sample: {} positions)", 
-
             positions_per_pack, positions_per_pack * pack_paths.len());
-
     }
-
     println!("================================================================================\n");
 
-
-
     let start = std::time::Instant::now();
-
     match eval::evaluate_inversions(weights_path, &pack_paths, positions_per_pack) {
-
         Ok(stats) => {
-
             let elapsed = start.elapsed();
-
             let total = stats.total as f64;
-
             let pct = |n: u64| (n as f64 / total.max(1.0)) * 100.0;
 
-
-
             println!("\nAnalysis completed in {:.2}s ({:.0} pos/sec across {} positions).\n",
-
                 elapsed.as_secs_f64(),
-
                 total / elapsed.as_secs_f64().max(0.001),
-
                 stats.total
-
             );
 
-
-
             println!("--------------------------------------------------------------------------------");
-
             println!("1. COMPLETE POLAR INVERSIONS (Model and Target disagree on sign at high cp)");
-
             println!("   Definition: Both |Target| >= T AND |Model Eval| >= T, with OPPOSITE signs!");
-
             println!("--------------------------------------------------------------------------------");
-
             println!("  Opposite sign at >= 200 cp (±2.0 pawns): {:>8} / {:>8} ({:6.4}%)",
-
                 stats.inv_200, stats.total, pct(stats.inv_200));
-
             println!("  Opposite sign at >= 300 cp (±3.0 pawns): {:>8} / {:>8} ({:6.4}%)",
-
                 stats.inv_300, stats.total, pct(stats.inv_300));
-
             println!("  Opposite sign at >= 500 cp (±5.0 pawns): {:>8} / {:>8} ({:6.4}%)",
-
                 stats.inv_500, stats.total, pct(stats.inv_500));
-
             println!("  Opposite sign at >= 800 cp (±8.0 pawns): {:>8} / {:>8} ({:6.4}%)",
-
                 stats.inv_800, stats.total, pct(stats.inv_800));
-
             println!("  Mate Inversions (|Target|>=2360, |Eval|>=200): {:>6} / {:>8} ({:6.4}%)",
-
                 stats.inv_mate, stats.total, pct(stats.inv_mate));
 
-
-
             println!("\n--------------------------------------------------------------------------------");
-
             println!("2. ONE-WAY POLARITY DISAGREEMENTS (Decisive positions misjudged across 0.0 cp)");
-
             println!("--------------------------------------------------------------------------------");
-
             let pct_300_win = (stats.win_pred_loss_300 as f64 / stats.count_target_ge_300.max(1) as f64) * 100.0;
-
             let pct_300_loss = (stats.loss_pred_win_300 as f64 / stats.count_target_ge_300.max(1) as f64) * 100.0;
-
             println!("  Target >= +300 cp, but Model < 0 cp (False Loss): {:>8} ({:5.2}% of decisive +300)",
-
                 stats.win_pred_loss_300, pct_300_win);
-
             println!("  Target <= -300 cp, but Model > 0 cp (False Win):  {:>8} ({:5.2}% of decisive -300)",
-
                 stats.loss_pred_win_300, pct_300_loss);
-
             println!("  Target >= +500 cp, but Model < 0 cp (False Loss): {:>8}", stats.win_pred_loss_500);
-
             println!("  Target <= -500 cp, but Model > 0 cp (False Win):  {:>8}", stats.loss_pred_win_500);
 
-
-
             println!("\n--------------------------------------------------------------------------------");
-
             println!("3. ABSOLUTE CENTIPAWN ERROR SPREAD");
-
             println!("--------------------------------------------------------------------------------");
-
             println!("  Error >=  300 cp: {:>8} ({:5.2}%)", stats.err_ge_300, pct(stats.err_ge_300));
-
             println!("  Error >=  500 cp: {:>8} ({:5.2}%)", stats.err_ge_500, pct(stats.err_ge_500));
-
             println!("  Error >=  800 cp: {:>8} ({:5.2}%)", stats.err_ge_800, pct(stats.err_ge_800));
-
             println!("  Error >= 1200 cp: {:>8} ({:5.2}%)", stats.err_ge_1200, pct(stats.err_ge_1200));
 
-
-
             if !stats.worst_inversions.is_empty() {
-
                 println!("\n--------------------------------------------------------------------------------");
-
                 println!("4. TOP EXTREME INVERSION SAMPLES (|Target|>=300, |Eval|>=300, Opposite Sign)");
-
                 println!("--------------------------------------------------------------------------------");
-
                 for (idx, (tgt, pred, err, desc)) in stats.worst_inversions.iter().enumerate() {
-
                     println!("  #{}: Target = {:+7.1} cp | Model = {:+7.1} cp | Delta = {:6.1} cp",
-
                         idx + 1, tgt, pred, err);
-
                     println!("      Board: {}", desc);
-
                 }
-
             }
-
             println!("================================================================================");
-
         }
-
         Err(e) => {
-
             eprintln!("Inversion analysis failed: {}", e);
-
         }
-
     }
-
 }
-
-
 
 fn run_dead_neurons(args: &[String]) {
     let default_weights = PathBuf::from(CHAMPION_FILE);
@@ -1701,125 +1130,64 @@ fn run_dead_neurons(args: &[String]) {
     let target_data = args.get(3).map(Path::new).unwrap_or(&default_data);
     let positions_per_pack: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50_000);
 
-
-
     if !weights_path.exists() {
-
         eprintln!("Error: weights file '{}' not found.", weights_path.display());
-
         return;
-
     }
-
-
 
     let mut pack_paths: Vec<PathBuf> = Vec::new();
-
     if target_data.is_dir() {
-
         if let Ok(entries) = fs::read_dir(target_data) {
-
             for entry in entries.flatten() {
-
                 let p = entry.path();
-
                 if p.extension().and_then(|s| s.to_str()) == Some("binpack") {
-
                     pack_paths.push(p);
-
                 }
-
             }
-
         }
-
         pack_paths.sort();
-
     } else if target_data.exists() {
-
         pack_paths.push(target_data.to_path_buf());
-
     }
-
-
 
     if pack_paths.is_empty() {
-
         eprintln!("Error: no .binpack files found in '{}'.", target_data.display());
-
         return;
-
     }
 
-
-
     let weights = match eval::NnueWeights::load_from_file(weights_path) {
-
         Ok(w) => w,
-
         Err(e) => {
-
             eprintln!("Failed to load weights: {}", e);
-
             return;
-
         }
-
     };
 
-
-
     println!("================================================================================");
-
     println!("NNUE Dead Neuron & Network Activity Analysis");
-
     println!("================================================================================");
-
     println!("  Weights File:          {}", weights_path.display());
-
     println!("  Activation:            SCReLU (clamp(x, 0, 1)^2)");
-
     println!("  Packs Analyzed:        {}", pack_paths.len());
-
     println!("  Positions per pack:    {}", positions_per_pack);
-
     println!("  Total Sample Target:   {} positions", pack_paths.len() * positions_per_pack);
-
     println!("================================================================================\n");
 
-
-
     let start = std::time::Instant::now();
-
     let diag = match diagnostics::analyze_weights(weights_path, &pack_paths, positions_per_pack) {
-
         Ok(d) => d,
-
         Err(e) => {
-
             eprintln!("Diagnostic analysis failed: {}", e);
-
             return;
-
         }
-
     };
-
     let elapsed = start.elapsed();
 
-
-
     println!("\nAnalysis completed in {:.2}s ({:.0} pos/sec across {} positions).\n",
-
         elapsed.as_secs_f64(),
-
         diag.total_positions as f64 / elapsed.as_secs_f64().max(0.001),
-
         diag.total_positions
-
     );
-
-
 
     // 1. Accumulator (L0: 256 neurons)
     println!("--------------------------------------------------------------------------------");
@@ -1955,12 +1323,8 @@ fn run_dead_neurons(args: &[String]) {
         println!("  - Layer 1: {} dead ({:?})", l1_dead.len(), l1_dead);
         println!("  - Layer 2: {} dead ({:?})", l2_dead.len(), l2_dead);
     }
-
     println!("================================================================================\n");
-
 }
-
-
 
 fn run_compare(args: &[String]) {
     let latest_folder = config::detect_latest_checkpoint().map(|(_, p)| p.to_string_lossy().to_string());
@@ -1968,8 +1332,6 @@ fn run_compare(args: &[String]) {
     let checkpoint_dir = args.get(2).map(|s| s.as_str()).unwrap_or(&default_dir);
 
     println!("Loading Bullet model from {}...", checkpoint_dir);
-
-
 
     let mut trainer = ValueTrainerBuilder::default()
         .dual_perspective()
@@ -2002,88 +1364,46 @@ fn run_compare(args: &[String]) {
             l3.forward(h2).select(output_buckets)
         });
 
-
-
     trainer.load_from_checkpoint(checkpoint_dir);
-
     println!("Successfully loaded Bullet checkpoint into GPU!");
 
-
-
     let exported_path = Path::new(CHAMPION_FILE);
-
     let cpu_weights = eval::NnueWeights::load_from_file(exported_path).expect("Failed to load exported weights");
 
-
-
     let test_fens = [
-
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-
         "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2",
-
         "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
-
         "r1bqkb1r/pppp1ppp/2n5/4p3/2B1n3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4",
-
         "8/8/8/4k3/8/8/4K3/4R3 w - - 0 1",
-
     ];
 
-
-
     println!("\n{:<60} | {:<25} | {:<12}", "FEN", "Bullet GPU", "CPU weights.bin");
-
     println!("{:-<60}-+-{:-<25}-+-{:-<12}", "", "", "");
 
-
-
     for fen in test_fens {
-
         let bullet_raw = trainer.eval_raw_output(fen)[0];
-
         let bullet_sig = 1.0 / (1.0 + (-bullet_raw).exp());
-
-
-
         let board = format!("{fen} | 0 | 0.0").parse::<bulletformat::ChessBoard>().unwrap();
-
         let cpu_pred = cpu_weights.evaluate(&board);
-
         println!("{:<60} | raw={:8.4} (sig={:.4}) | sig={:.4}", 
-
             if fen.len() > 60 { &fen[..60] } else { fen },
-
             bullet_raw, bullet_sig, cpu_pred);
-
     }
-
 }
 
-
-
 fn main() {
-
     let args: Vec<String> = env::args().collect();
-
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
-
-
     match command {
-
         "train" => run_train(&args, false),
-
         "resume" => run_train(&args, true),
-
         "status" => run_status(),
-
+        "sprt" => run_sprt(&args),
         "check" => run_check(&args),
-
         "eval" => run_eval(&args),
-
         "export" => run_export(&args),
-
         "scratch" => {
             let cfg = TrainerConfig::load_or_default();
             let default_out = PathBuf::from(SCRATCH_FILE);
@@ -2091,40 +1411,18 @@ fn main() {
             export::generate_scratch_kitty_weights(&out, cfg.bias_l0, cfg.bias_l1, cfg.bias_l2).expect("Failed to generate scratch weights");
             println!("Scratch weights generated successfully at {}", out.display());
         }
-
         "compare" => run_compare(&args),
-
         "info" => run_info(),
-
-        "dead-neurons" | "dead" | "check-neurons" => run_dead_neurons(&args),
-
-        "inversions" | "eval-inversions" | "outliers" => run_inversions(&args),
-
+        "dead-neurons" | "dead" => run_dead_neurons(&args),
+        "inversions" => run_inversions(&args),
         "import" => run_import(&args),
-
-        "pack-chunks" | "convert" => run_pack_chunks(&args),
-
-        "fold-v5" => {
-            let in_path = args.get(2).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("checkpoints_v5_backup/champion_weights.bin"));
-            let out_path = args.get(3).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("checkpoints/champion_warmstart_8bucket.bin"));
-            export::fold_v5_to_v6_warmstart(&in_path, &out_path).expect("Failed to fold v5 weights");
-        }
-
+        "pack-chunks" => run_pack_chunks(&args),
         "help" | "--help" | "-h" => print_usage(),
-
         other => {
-
             if other != "help" {
-
                 eprintln!("Unknown command: '{}'\n", other);
-
             }
-
             print_usage();
-
         }
-
     }
-
 }
-

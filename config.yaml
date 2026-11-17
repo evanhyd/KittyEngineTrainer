@@ -29,3 +29,28 @@ save_interval: 1
 bias_l0: 0.05
 bias_l1: 0.35
 bias_l2: 0.35
+
+# ==============================================================================
+# SPRT (Sequential Probability Ratio Test) Automated Verification
+# ==============================================================================
+# SPRT is the EXCLUSIVE gate for champion promotion.
+# When a checkpoint is reached, an SPRT match is conducted against the active champion.
+# Candidate is promoted ONLY if H1 is accepted (statistically verified stronger).
+sprt:
+  enabled: true
+  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
+  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
+  book_depth: 8
+  time_control: "5+0.1"
+  concurrency: 2
+  max_rounds: 200
+  elo0: 0.0
+  elo1: 5.0
+  alpha: 0.05
+  beta: 0.05
+  draw_movenumber: 40
+  draw_movecount: 8
+  draw_score: 10
+  resign_movecount: 4
+  resign_score: 550

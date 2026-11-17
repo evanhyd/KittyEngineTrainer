@@ -52,6 +52,27 @@ save_interval: 1
 bias_l0: 0.05
 bias_l1: 0.35
 bias_l2: 0.35
+
+# SPRT Automated Verification (Cutechess-CLI)
+# Exclusive gate for champion promotion: candidate promotes ONLY if H1 is accepted
+sprt:
+  enabled: true
+  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
+  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
+  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
+  book_depth: 8
+  time_control: "5+0.1"
+  concurrency: 2
+  max_rounds: 200
+  elo0: 0.0
+  elo1: 5.0
+  alpha: 0.05
+  beta: 0.05
+  draw_movenumber: 40
+  draw_movecount: 8
+  draw_score: 10
+  resign_movecount: 4
+  resign_score: 550
 ```
 
 ---
@@ -64,9 +85,10 @@ The trainer provides a clean, single-word command interface:
 
 | Command | Usage | Description |
 | :--- | :--- | :--- |
-| **`status`** | `cargo run --release -- status` | **Instant inspection (<100ms)**: Displays active configuration, current champion metrics, latest Bullet step, and recent training history. |
+| **`status`** | `cargo run --release -- status` | **Instant inspection (<100ms)**: Displays active configuration, SPRT settings, current champion metrics, latest Bullet step, and recent training history. |
 | **`resume`** | `cargo run --release -- resume` | **One-click resume**: Auto-detects the latest checkpoint in `checkpoints/`, sets the next step, preserves smooth Cosine Annealing, and trains up to `superbatches`. |
-| **`train`** | `cargo run --release -- train` | **Start fresh**: Initializes fresh weights with positive biases (`0.05, 0.35, 0.35`), streams data from `data/`, and evaluates checkpoints after every superbatch. |
+| **`train`** | `cargo run --release -- train` | **Start fresh**: Initializes fresh weights with positive biases (`0.05, 0.35, 0.35`), streams data from `data/`, evaluates checkpoints, and runs automated SPRT verification for champion promotion. |
+| **`sprt`** | `cargo run --release -- sprt [cand] [champ]` | **Playtesting verification**: Runs an automated Cutechess SPRT match between candidate and champion weights with live score and Elo telemetry. |
 | **`check`** | `cargo run --release -- check [weights.bin]` | **Unified audit**: Runs empirical Dead Neuron telemetry across all layers and detects high-centipawn polar sign disagreements against ground truth. |
 | **`eval`** | `cargo run --release -- eval [weights.bin]` | **Benchmark evaluation**: Measures MAE, SMSE, log-loss (BCE), MSE, RMSE, and mating accuracy across all dataset packs in `data/`. |
 | **`export`** | `cargo run --release -- export [step] [out.bin]` | **Weight export**: Converts any Bullet checkpoint (e.g. `export 115`) or raw checkpoint into KittyEngine binary format (`weights.bin` or custom name). |
@@ -92,6 +114,7 @@ KittyEngineTrainer/
 │   └── weights_step_*.bin       # Preserved tournament weights for playtesting
 ├── src/
 │   ├── main.rs          # CLI entry point, scheduler, and commands
+│   ├── sprt.rs          # Automated Cutechess SPRT match pipeline & parser
 │   ├── config.rs        # Configuration loader, defaults, and checkpoint detection
 │   ├── inputs.rs        # KittyHalfKA folded feature mapper (24,576 inputs)
 │   ├── eval.rs          # Multi-threaded validation engine and metric computation
