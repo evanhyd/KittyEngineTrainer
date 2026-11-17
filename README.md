@@ -28,7 +28,7 @@ KittyEngineTrainer uses live engine-vs-engine playtesting as the **exclusive gat
 
 1. **Hypothesis Testing**: Evaluates $H_0: \Delta\text{Elo} \le \text{elo0}$ against $H_1: \Delta\text{Elo} \ge \text{elo1}$ with significance parameters $\alpha$ (Type I error) and $\beta$ (Type II error).
 2. **Zero-Binary Sandboxing**: Candidate and champion weights are staged as `weights.bin` in isolated temporary sandboxes (`checkpoints/sprt_sandbox/candidate` and `checkpoints/sprt_sandbox/champion`) alongside `search_config.yaml`. The engine binary runs from its build directory with `dir=` set to the sandbox, preventing file-locking collisions and binary duplication.
-3. **Automated Adjudication**: Fast-forwards obvious positions using Polyglot opening books, draw adjudication (e.g. 8 consecutive plies with score $\le 10\text{ cp}$ after move 40), and resign adjudication (score $\le -550\text{ cp}$ for 4 plies).
+3. **Automated Adjudication**: Fast-forwards obvious positions using Polyglot opening books, draw adjudication, and resign adjudication rules for maximum throughput.
 4. **Promotion Decision**:
    - **$H_1$ Accepted**: The candidate is statistically superior $\to$ instantly promoted to `checkpoints/champion_weights.bin` and recorded in `baseline.json`.
    - **$H_0$ Accepted / Inconclusive**: Candidate failed to beat the champion $\to$ champion retained; unpromoted checkpoint weights are cleaned up unless `save_interval` preserves them.
@@ -51,61 +51,15 @@ All logs use standard default paths under `checkpoints/` without configuration c
 
 ## ⚙️ Configuration (`config.yaml`)
 
-Training parameters, learning rate decay, validation batch sizes, positive bias initializations, and SPRT match settings are centrally configured:
+Training hyperparameters, learning rate schedules, dataset validation, and SPRT playtesting settings are centrally managed in `config.yaml`:
 
-```yaml
-# Total target superbatches for the training run
-superbatches: 200
-
-# WDL score distillation factor (0.0 = pure centipawns, 1.0 = pure WDL outcome)
-wdl: 0.20
-
-# Peak learning rate for Cosine Annealing decay
-lr: 0.0025
-
-# Minimum learning rate at cycle completion
-min_lr: 0.0005
-
-# Training batch size in positions (GTX 1660 Ti safe: 16384)
-batch_size: 16384
-
-# Validation positions evaluated per pack during checkpoint evaluation
-eval_positions_per_pack: 2000000
-
-# Periodic weight export interval
-# Automatically exports and preserves 'checkpoints/weights_step_<N>.bin' every N superbatches
-# Set to 1 to preserve every superbatch for tournament playtesting
-save_interval: 1
-
-# Positive Bias Initialization (Layer 0, Layer 1, Layer 2)
-bias_l0: 0.05
-bias_l1: 0.35
-bias_l2: 0.35
-
-# ==============================================================================
-# SPRT (Sequential Probability Ratio Test) Automated Verification
-# ==============================================================================
-# SPRT is the EXCLUSIVE gate for champion promotion.
-sprt:
-  enabled: true
-  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
-  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
-  engine_args: "--mode bullet"
-  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
-  book_depth: 8
-  time_control: "5+0.1"
-  concurrency: 2
-  max_rounds: 200
-  elo0: 0.0
-  elo1: 10.0
-  alpha: 0.05
-  beta: 0.15
-  draw_movenumber: 40
-  draw_movecount: 8
-  draw_score: 10
-  resign_movecount: 4
-  resign_score: 550
-```
+- **Training**: Target superbatches, batch size, peak/minimum learning rates (`lr`, `min_lr`), WDL lambda distillation factor, and positive bias initializations.
+- **Validation & Checkpointing**: Validation positions per pack, periodic tournament weight export interval (`save_interval`).
+- **SPRT Verification**:
+  - Binary and engine paths: `cutechess_path`, `engine_path`, and `engine_args`.
+  - Game conditions: `time_control`, `concurrency`, and opening book configuration (`book_path`, `book_depth`).
+  - Statistical testing: `elo0`, `elo1`, significance levels (`alpha`, `beta`), and max rounds.
+  - Match adjudication: Early draw and resignation thresholds (`draw_*`, `resign_*`).
 
 ---
 
