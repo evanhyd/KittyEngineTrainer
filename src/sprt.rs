@@ -75,6 +75,40 @@ pub struct SprtMatchResult {
     pub ubound: Option<f64>,
 }
 
+impl SprtMatchResult {
+    /// Determines whether the candidate qualifies for champion promotion.
+    ///
+    /// Promotion is awarded if:
+    /// 1. SPRT accepted H1 (statistically proven superior prior to or at max rounds).
+    /// 2. The match concluded (including inconclusive cutoff at max rounds) with a decisive lead:
+    ///    - Score >= 55.0% ((wins + 0.5 * draws) / total_games >= 0.55)
+    ///    - wins > losses
+    ///    - Elo Diff >= elo1 (e.g. +10.0 Elo)
+    ///    - LLR > 0.0 (positive log-likelihood ratio)
+    pub fn should_promote(&self, elo1: f64) -> (bool, &'static str) {
+        if self.decision == SprtDecision::AcceptedH1 {
+            return (true, "Accepted H1 (Candidate statistically superior under SPRT)");
+        }
+
+        let score = if self.total_games > 0 {
+            (self.wins as f64 + 0.5 * self.draws as f64) / self.total_games as f64
+        } else {
+            0.0
+        };
+        let elo_diff = self.elo_diff.unwrap_or(0.0);
+        let llr = self.llr.unwrap_or(0.0);
+
+        if score >= 0.55 && self.wins > self.losses && elo_diff >= elo1 && llr > 0.0 {
+            return (
+                true,
+                "Decisive lead at cutoff (score >= 55%, wins > losses, Elo Diff >= elo1, LLR > 0)",
+            );
+        }
+
+        (false, "Did not satisfy SPRT promotion criteria")
+    }
+}
+
 struct SandboxGuard {
     sandbox_dir: PathBuf,
 }
@@ -396,6 +430,20 @@ pub fn run_sprt_match(
         SprtDecision::Inconclusive
     };
 
+    let temp_res = SprtMatchResult {
+        decision: decision.clone(),
+        wins,
+        losses,
+        draws,
+        total_games,
+        elo_diff,
+        elo_error,
+        llr,
+        lbound,
+        ubound,
+    };
+    let (promoted, promo_reason) = temp_res.should_promote(config.elo1);
+
     println!("--------------------------------------------------------------------------------");
     println!("SPRT Match Result:");
     println!("  Total Games: {}", total_games);
@@ -412,14 +460,27 @@ pub fn run_sprt_match(
     match &decision {
         SprtDecision::AcceptedH1 => println!("  🏆 VERDICT: ACCEPT H1 (Candidate is statistically superior -> Promoted to Champion!)"),
         SprtDecision::AcceptedH0 => println!("  ❌ VERDICT: ACCEPT H0 (Candidate failed SPRT -> Champion retained)"),
-        SprtDecision::Inconclusive => println!("  ⚖️ VERDICT: INCONCLUSIVE (Max rounds reached without hypothesis confirmation)"),
+        SprtDecision::Inconclusive => {
+            if promoted {
+                println!("  🏆 VERDICT: INCONCLUSIVE with DECISIVE LEAD -> QUALIFIED FOR PROMOTION!");
+                println!("     Reason: {}", promo_reason);
+            } else {
+                println!("  ⚖️ VERDICT: INCONCLUSIVE (Max rounds reached without hypothesis confirmation)");
+            }
+        }
     }
     println!("================================================================================\n");
 
     let verdict_str = match &decision {
-        SprtDecision::AcceptedH1 => "ACCEPTED H1 (Candidate statistically superior)",
-        SprtDecision::AcceptedH0 => "ACCEPTED H0 (Candidate failed to beat Champion)",
-        SprtDecision::Inconclusive => "INCONCLUSIVE (Max rounds reached)",
+        SprtDecision::AcceptedH1 => "ACCEPTED H1 (Candidate statistically superior)".to_string(),
+        SprtDecision::AcceptedH0 => "ACCEPTED H0 (Candidate failed to beat Champion)".to_string(),
+        SprtDecision::Inconclusive => {
+            if promoted {
+                format!("INCONCLUSIVE with DECISIVE LEAD (Qualified for promotion: {})", promo_reason)
+            } else {
+                "INCONCLUSIVE (Max rounds reached)".to_string()
+            }
+        }
     };
     let elo_str = if let (Some(diff), Some(err)) = (elo_diff, elo_error) {
         format!("{:+.1} +/- {:.1}", diff, err)
@@ -526,5 +587,123 @@ mod tests {
         let ts = current_timestamp();
         assert!(ts.ends_with(" UTC"));
         assert_eq!(ts.len(), 23); // "YYYY-MM-DD HH:MM:SS UTC"
+    }
+
+    #[test]
+    fn test_should_promote_policy() {
+        let elo1 = 10.0;
+
+        // 1. AcceptedH1 always promotes
+        let res_h1 = SprtMatchResult {
+            decision: SprtDecision::AcceptedH1,
+            wins: 10,
+            losses: 2,
+            draws: 5,
+            total_games: 17,
+            elo_diff: Some(15.0),
+            elo_error: Some(10.0),
+            llr: Some(2.95),
+            lbound: Some(-2.94),
+            ubound: Some(2.94),
+        };
+        let (promote, _) = res_h1.should_promote(elo1);
+        assert!(promote);
+
+        // 2. AcceptedH0 never promotes
+        let res_h0 = SprtMatchResult {
+            decision: SprtDecision::AcceptedH0,
+            wins: 5,
+            losses: 15,
+            draws: 10,
+            total_games: 30,
+            elo_diff: Some(-20.0),
+            elo_error: Some(10.0),
+            llr: Some(-3.0),
+            lbound: Some(-2.94),
+            ubound: Some(2.94),
+        };
+        let (promote, _) = res_h0.should_promote(elo1);
+        assert!(!promote);
+
+        // 3. Inconclusive with decisive lead (Step 290 case: +80 -29 =91, Elo +90.6, LLR 2.75) -> promotes!
+        let res_step290 = SprtMatchResult {
+            decision: SprtDecision::Inconclusive,
+            wins: 80,
+            losses: 29,
+            draws: 91,
+            total_games: 200,
+            elo_diff: Some(90.6),
+            elo_error: Some(35.8),
+            llr: Some(2.75),
+            lbound: Some(-1.85),
+            ubound: Some(2.83),
+        };
+        let (promote, reason) = res_step290.should_promote(elo1);
+        assert!(promote);
+        assert!(reason.contains("Decisive lead"));
+
+        // 4. Inconclusive with low score (< 55%) -> does not promote
+        let res_low_score = SprtMatchResult {
+            decision: SprtDecision::Inconclusive,
+            wins: 53,
+            losses: 37,
+            draws: 110,
+            total_games: 200, // score = (53 + 55)/200 = 108/200 = 54.0%
+            elo_diff: Some(27.9),
+            elo_error: Some(32.3),
+            llr: Some(0.845),
+            lbound: Some(-1.85),
+            ubound: Some(2.83),
+        };
+        let (promote, _) = res_low_score.should_promote(elo1);
+        assert!(!promote);
+
+        // 5. Inconclusive with wins <= losses -> does not promote
+        let res_losses_high = SprtMatchResult {
+            decision: SprtDecision::Inconclusive,
+            wins: 20,
+            losses: 25,
+            draws: 155,
+            total_games: 200,
+            elo_diff: Some(12.0),
+            elo_error: Some(10.0),
+            llr: Some(0.5),
+            lbound: Some(-1.85),
+            ubound: Some(2.83),
+        };
+        let (promote, _) = res_losses_high.should_promote(elo1);
+        assert!(!promote);
+
+        // 6. Inconclusive with Elo diff < elo1 -> does not promote
+        let res_low_elo = SprtMatchResult {
+            decision: SprtDecision::Inconclusive,
+            wins: 60,
+            losses: 30,
+            draws: 110,
+            total_games: 200,
+            elo_diff: Some(8.5), // < 10.0
+            elo_error: Some(5.0),
+            llr: Some(1.2),
+            lbound: Some(-1.85),
+            ubound: Some(2.83),
+        };
+        let (promote, _) = res_low_elo.should_promote(elo1);
+        assert!(!promote);
+
+        // 7. Inconclusive with negative or zero LLR -> does not promote
+        let res_neg_llr = SprtMatchResult {
+            decision: SprtDecision::Inconclusive,
+            wins: 60,
+            losses: 30,
+            draws: 110,
+            total_games: 200,
+            elo_diff: Some(25.0),
+            elo_error: Some(5.0),
+            llr: Some(-0.1),
+            lbound: Some(-1.85),
+            ubound: Some(2.83),
+        };
+        let (promote, _) = res_neg_llr.should_promote(elo1);
+        assert!(!promote);
     }
 }

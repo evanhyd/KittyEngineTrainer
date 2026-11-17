@@ -168,8 +168,11 @@ fn run_sprt(args: &[String]) {
 
     match sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path) {
         Ok(res) => {
-            if res.decision == sprt::SprtDecision::AcceptedH1 {
-                println!("Candidate statistically verified superior to Champion under SPRT.");
+            let (passed, reason) = res.should_promote(cfg.sprt.elo1);
+            if passed {
+                println!("Candidate verified superior to Champion under SPRT ({}).", reason);
+            } else {
+                println!("Candidate did not meet criteria to defeat Champion under SPRT.");
             }
         }
         Err(e) => {
@@ -784,19 +787,22 @@ fn run_train(args: &[String], is_resume: bool) {
                         println!("\n⚔️ RUNNING AUTOMATED SPRT PROMOTION MATCH (Candidate Step {} vs Active Champion)...", step);
                         match sprt::run_sprt_match(&cfg.sprt, Path::new(&exported_bin), champion_file) {
                             Ok(res) => {
-                                let passed = res.decision == sprt::SprtDecision::AcceptedH1;
+                                let (passed, reason) = res.should_promote(cfg.sprt.elo1);
                                 if passed {
                                     println!("\n🏆 NEW ALL-TIME CHAMPION PROMOTED VIA SPRT!");
-                                    println!("  Candidate defeated Champion: +{} -{} ={} (Elo {:+.1} +/- {:.1})",
+                                    println!("  Reason: {}", reason);
+                                    println!("  Candidate defeated Champion: +{} -{} ={} (Elo {:+.1} +/- {:.1}, LLR: {:.4})",
                                         res.wins, res.losses, res.draws,
-                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0));
+                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0),
+                                        res.llr.unwrap_or(0.0));
                                     let _ = fs::copy(&exported_bin, CHAMPION_FILE);
                                     baseline_mae = overall.mae();
                                     baseline_smse = overall.smse();
                                     let promo_entry = format!(
-                                        "[{}] 👑 CHAMPION PROMOTED\n  Step:     {}\n  Score:    +{} -{} ={} | Elo: {:+.1} +/- {:.1}\n  Promoted: {}\n  --------------------------------------------------------------------------------",
-                                        sprt::current_timestamp(), step, res.wins, res.losses, res.draws,
+                                        "[{}] 👑 CHAMPION PROMOTED\n  Step:     {}\n  Reason:   {}\n  Score:    +{} -{} ={} | Elo: {:+.1} +/- {:.1} | LLR: {:.4}\n  Promoted: {}\n  --------------------------------------------------------------------------------",
+                                        sprt::current_timestamp(), step, reason, res.wins, res.losses, res.draws,
                                         res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0),
+                                        res.llr.unwrap_or(0.0),
                                         CHAMPION_FILE
                                     );
                                     sprt::append_to_match_log(&promo_entry);
@@ -836,8 +842,10 @@ fn run_train(args: &[String], is_resume: bool) {
                             "weights_file": CHAMPION_FILE,
                         });
                         if let Some(ref s) = sprt_stats {
+                            let (_, reason) = s.should_promote(cfg.sprt.elo1);
                             rec["sprt"] = serde_json::json!({
                                 "decision": format!("{:?}", s.decision),
+                                "promotion_reason": reason,
                                 "wins": s.wins,
                                 "losses": s.losses,
                                 "draws": s.draws,
