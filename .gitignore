@@ -9,6 +9,15 @@
 checkpoints_*/
 /data/
 /scratch/
+/logs/
+/state/
+/history/
+/engine/
+*.pgn
+
+# SPSA runtime state & logs
+spsa_state*.json
+deploy_log.txt
 
 # Compiled native binaries and libraries
 *.exe

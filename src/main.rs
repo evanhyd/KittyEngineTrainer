@@ -6,6 +6,7 @@ mod diagnostics;
 mod config;
 mod sprt;
 mod signal;
+mod spsa;
 
 use std::env;
 use std::fs;
@@ -43,6 +44,7 @@ fn print_usage() {
     println!("  stop                        Gracefully signal active trainer to stop without data corruption");
     println!("  status                      Display active champion metrics, SPRT settings & history");
     println!("  sprt [cand] [champ]         Run automated Cutechess SPRT match between two weight files");
+    println!("  spsa [SUBCOMMAND]           Autonomous SPSA search heuristic tuner (run, status, verify, deploy, reset)");
     println!("  check [weights.bin]         Run comprehensive health checks (Dead Neurons + Inversions)");
     println!("  eval [weights.bin]          Evaluate model metrics across all packs in 'data/'");
     println!("  export [step] [out.bin]     Export checkpoint to KittyEngine binary format (default: weights.bin)");
@@ -1572,6 +1574,7 @@ fn main() {
         "stop" => run_stop(),
         "status" => run_status(),
         "sprt" => run_sprt(&args),
+        "spsa" => spsa::run_spsa_cli(&args),
         "check" => run_check(&args),
         "eval" => run_eval(&args),
         "export" => run_export(&args),

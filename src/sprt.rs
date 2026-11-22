@@ -325,6 +325,12 @@ pub fn run_sprt_match(
             Err(_) => break,
         };
 
+        if line.contains("Error:") {
+            eprintln!("\n  [Cutechess Error] {}", line.trim());
+        }
+
+        let mut updated = false;
+
         // Parse live score: "Score of Candidate vs Champion: 10 - 5 - 15  [0.583] 30"
         if line.starts_with("Score of Candidate vs Champion:") {
             let parts: Vec<&str> = line.split(':').collect();
@@ -340,9 +346,9 @@ pub fn run_sprt_match(
                         losses = l;
                         draws = d;
                         total_games = w + l + d;
+                        updated = true;
                     }
             }
-            println!("  📊 {}", line);
         }
 
         // Parse Elo difference: "Elo difference: 14.5 +/- 8.2, LOS: ..."
@@ -353,6 +359,7 @@ pub fn run_sprt_match(
                 if !tokens.is_empty()
                     && let Ok(val) = tokens[0].parse::<f64>() {
                         elo_diff = Some(val);
+                        updated = true;
                     }
                 if tokens.len() >= 3 && tokens[1] == "+/-" {
                     let err_str = tokens[2].trim_end_matches(',');
@@ -364,13 +371,13 @@ pub fn run_sprt_match(
 
         // Parse SPRT stats: "SPRT: llr 0.0269 (0.9%), lbound -2.94, ubound 2.94"
         if line.contains("SPRT:") {
-            println!("  {}", line);
             // Parse LLR
             if let Some(llr_pos) = line.find("llr ") {
                 let sub = &line[llr_pos + 4..];
                 if let Some(end) = sub.find([' ', '('])
                     && let Ok(v) = sub[..end].parse::<f64>() {
                         llr = Some(v);
+                        updated = true;
                     }
             }
             // Parse lbound
@@ -398,9 +405,33 @@ pub fn run_sprt_match(
         } else if lower.contains("accept h0") || lower.contains("h0 was accepted") || lower.contains("candidate is not stronger") || lower.contains("champion is stronger") {
             explicit_decision = Some(SprtDecision::AcceptedH0);
         }
+
+        if updated {
+            let win_pct = if total_games > 0 {
+                (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0
+            } else {
+                0.0
+            };
+            let elo_str = match (elo_diff, elo_error) {
+                (Some(e), Some(err)) => format!("Elo: {:>+5.1} +/- {:<4.1}", e, err),
+                (Some(e), None) => format!("Elo: {:>+5.1}", e),
+                _ => "Elo:   ...".to_string(),
+            };
+            let llr_str = match (llr, lbound, ubound) {
+                (Some(l), Some(lb), Some(ub)) => format!("LLR: {:>+5.2} [{:.2}, {:.2}]", l, lb, ub),
+                (Some(l), _, _) => format!("LLR: {:>+5.2}", l),
+                _ => "LLR: ...".to_string(),
+            };
+            print!(
+                "\r  [SPRT Match] Games: {:>3}/{} (+{} -{} ={}) [{:.1}%] | {} | {}  ",
+                total_games, config.max_rounds * 2, wins, losses, draws, win_pct, elo_str, llr_str
+            );
+            let _ = std::io::stdout().flush();
+        }
     }
 
     let status = child.wait().map_err(|e| format!("Cutechess process wait error: {}", e))?;
+    println!();
     if !status.success() {
         eprintln!("[sprt] Warning: Cutechess exited with status: {}", status);
     }
