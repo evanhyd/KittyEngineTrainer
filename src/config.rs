@@ -9,6 +9,14 @@ pub const SCRATCH_FILE: &str = "checkpoints/scratch_weights_init.bin";
 pub const SPRT_MATCH_LOG: &str = "checkpoints/sprt_matches.log";
 pub const SPRT_GAMES_PGN: &str = "checkpoints/sprt_games.pgn";
 
+pub const INPUT_SIZE: usize = 24_576;
+pub const ACCUM_SIZE: usize = 256;
+pub const PAIRWISE_SIZE: usize = 256;
+pub const HIDDEN1_SIZE: usize = 64;
+pub const HIDDEN2_SIZE: usize = 32;
+pub const NUM_OUTPUT_BUCKETS: usize = 8;
+pub const CHECKPOINT_SIZE: u64 = 25_242_088;
+
 fn default_true() -> bool { true }
 fn default_cutechess_path() -> String { "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe".to_string() }
 fn default_engine_path() -> String { "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe".to_string() }
@@ -149,6 +157,8 @@ pub struct TrainerConfig {
     pub lr: f32,
     pub min_lr: f32,
     pub batch_size: usize,
+    #[serde(default)]
+    pub batches_per_superbatch: Option<usize>,
     pub eval_positions_per_pack: usize,
     pub save_interval: usize,
     pub bias_l0: f32,
@@ -161,78 +171,82 @@ pub struct TrainerConfig {
 impl Default for TrainerConfig {
     fn default() -> Self {
         Self {
-            superbatches: 200,
-            wdl: 0.20,
-            lr: 0.0025,
-            min_lr: 0.0005,
+            superbatches: 300,
+            wdl: 0.08,
+            lr: 0.0015,
+            min_lr: 0.00005,
             batch_size: 16_384,
-            eval_positions_per_pack: 2_000_000,
-            save_interval: 1,
+            batches_per_superbatch: Some(4096),
+            eval_positions_per_pack: 100_000,
+            save_interval: 15,
             bias_l0: 0.05,
             bias_l1: 0.35,
-            bias_l2: 0.35,
+            bias_l2: 0.55,
             sprt: SprtConfig::default(),
         }
     }
 }
 
 const DEFAULT_CONFIG_YAML: &str = r#"# ==============================================================================
-# KittyEngineTrainer Configuration
+# KittyEngineTrainer Configuration (Optimized for High-Throughput Training)
 # ==============================================================================
 
-# Total target superbatches for the training run
-superbatches: 200
+# Target 300 superbatches * 4096 batches * 16384 batch_size = ~20.13 Billion positions
+# (~1.0 epoch of clean filtered positions)
+superbatches: 300
 
-# WDL lambda distillation factor (0.0 = pure centipawns, 1.0 = pure WDL outcome)
-wdl: 0.20
+# WDL lambda distillation factor (92% deep search score, 8% game outcome)
+wdl: 0.08
 
 # Peak learning rate for Cosine Annealing decay
-lr: 0.0025
+lr: 0.0015
 
 # Minimum learning rate at cycle completion
-min_lr: 0.0005
+min_lr: 0.00005
 
-# Training batch size in positions (GTX 1660 Ti safe: 16384)
+# Training batch size in positions (safe for 6 GB GTX 1660 Ti VRAM)
 batch_size: 16384
 
-# Validation positions evaluated per pack during checkpoint evaluation
-eval_positions_per_pack: 2000000
+# Number of batches per superbatch (4096 * 16384 = ~67.11M positions/sb)
+batches_per_superbatch: 4096
 
-# Periodic weight export interval
-# Automatically exports and preserves 'checkpoints/weights_step_<N>.bin' every N superbatches
-# Set to 1 to keep every superbatch, or 2, 5, etc. for tournament playtesting checkpoints
-save_interval: 1
+# Fast CPU validation sample: 100k positions per pack (600k total)
+# Evaluates in ~2-3 seconds instead of stalling training for minutes
+eval_positions_per_pack: 100000
+
+# Checkpoint & SPRT interval: every 15 superbatches (~every 1.0 Billion positions)
+# Evaluates 20 times total across the 300-sb run instead of interrupting every step!
+save_interval: 15
 
 # Positive Bias Initialization (Layer 0, Layer 1, Layer 2)
+# L1=0.35, L2=0.55 provide robust safety cushion against SCReLU dying neurons
 bias_l0: 0.05
 bias_l1: 0.35
-bias_l2: 0.35
+bias_l2: 0.55
 
 # ==============================================================================
 # SPRT (Sequential Probability Ratio Test) Automated Verification
 # ==============================================================================
-# SPRT is the EXCLUSIVE gate for champion promotion.
-# When a checkpoint is reached, an SPRT match is conducted against the active champion.
-# Candidate is promoted ONLY if H1 is accepted (statistically verified stronger).
 sprt:
   enabled: true
   cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
-  engine_path: "C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/KittyEngineV5.exe"
-  engine_args: ""
+  engine_path: "C:/Users/evanh/works/software/cutechess/engines/KittyEngineV5_experimental/KittyEngineV5.exe"
+  engine_args: "--mode bullet"
   book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
-  book_depth: 8
-  time_control: "5+0.1"
-  concurrency: 2
-  max_rounds: 200
+  book_depth: 1
+  # Fast bullet (2s + 0.02s) with 12 parallel games: finishes 40-60 games in ~45 seconds!
+  time_control: "2+0.02"
+  concurrency: 12
+  max_rounds: 60
   elo0: 0.0
-  elo1: 10.0
+  elo1: 15.0
   alpha: 0.05
   beta: 0.15
   draw_movenumber: 40
   draw_movecount: 8
   draw_score: 10
-  resign_movecount: 4
-  resign_score: 550
+  resign_movecount: 6
+  resign_score: 500
 "#;
 
 impl TrainerConfig {
@@ -241,21 +255,33 @@ impl TrainerConfig {
         let json_path = Path::new("config.json");
 
         if yaml_path.exists() {
-            if let Ok(content) = fs::read_to_string(yaml_path) {
-                if let Ok(cfg) = serde_yaml::from_str::<TrainerConfig>(&content) {
-                    println!("[config] Loaded configuration from config.yaml");
-                    return cfg;
-                } else {
-                    eprintln!("[config] Warning: Failed to parse config.yaml, using defaults.");
+            match fs::read_to_string(yaml_path) {
+                Ok(content) => match serde_yaml::from_str::<TrainerConfig>(&content) {
+                    Ok(cfg) => {
+                        println!("[config] Loaded configuration from config.yaml");
+                        return cfg;
+                    }
+                    Err(e) => {
+                        eprintln!("[config] Warning: Failed to parse config.yaml: {}. Using defaults.", e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[config] Warning: Failed to read config.yaml: {}. Using defaults.", e);
                 }
             }
         } else if json_path.exists() {
-            if let Ok(content) = fs::read_to_string(json_path) {
-                if let Ok(cfg) = serde_json::from_str::<TrainerConfig>(&content) {
-                    println!("[config] Loaded configuration from config.json");
-                    return cfg;
-                } else {
-                    eprintln!("[config] Warning: Failed to parse config.json, using defaults.");
+            match fs::read_to_string(json_path) {
+                Ok(content) => match serde_json::from_str::<TrainerConfig>(&content) {
+                    Ok(cfg) => {
+                        println!("[config] Loaded configuration from config.json");
+                        return cfg;
+                    }
+                    Err(e) => {
+                        eprintln!("[config] Warning: Failed to parse config.json: {}. Using defaults.", e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[config] Warning: Failed to read config.json: {}. Using defaults.", e);
                 }
             }
         } else {
@@ -285,39 +311,32 @@ pub fn detect_latest_checkpoint() -> Option<(usize, PathBuf)> {
     if let Ok(entries) = fs::read_dir(cp_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                    if let Some(step_str) = name.strip_prefix("kitty_bullet_screlu-") {
-                        if let Ok(step) = step_str.parse::<usize>() {
-                            if step >= highest_step && path.join("raw.bin").exists() {
+            if path.is_dir()
+                && let Some(name) = path.file_name().and_then(|s| s.to_str())
+                    && let Some(step_str) = name.strip_prefix("kitty_bullet_screlu-")
+                        && let Ok(step) = step_str.parse::<usize>()
+                            && step >= highest_step && path.join("raw.bin").exists() {
                                 highest_step = step;
                                 highest_path = Some(path);
                             }
-                        }
-                    }
-                }
-            }
         }
     }
 
-    if highest_step > 0 && highest_path.is_some() {
-        return Some((highest_step, highest_path.unwrap()));
-    }
+    if highest_step > 0
+        && let Some(path) = highest_path {
+            return Some((highest_step, path));
+        }
 
     // Fallback: check baseline.json or training_history.json
     let history_path = cp_dir.join("training_history.json");
-    if history_path.exists() {
-        if let Ok(content) = fs::read_to_string(&history_path) {
-            if let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-                if let Some(last) = records.last() {
-                    if let Some(step) = last.get("step").and_then(|v| v.as_u64()).map(|v| v as usize) {
+    if history_path.exists()
+        && let Ok(content) = fs::read_to_string(&history_path)
+            && let Ok(records) = serde_json::from_str::<Vec<serde_json::Value>>(&content)
+                && let Some(last) = records.last()
+                    && let Some(step) = last.get("step").and_then(|v| v.as_u64()).map(|v| v as usize) {
                         let folder = cp_dir.join(format!("kitty_bullet_screlu-{}", step));
                         return Some((step, folder));
                     }
-                }
-            }
-        }
-    }
 
     None
 }

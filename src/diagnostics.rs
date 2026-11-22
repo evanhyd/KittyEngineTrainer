@@ -1,9 +1,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use rayon::prelude::*;
-use bulletformat::{ChessBoard, DataLoader};
-use crate::inputs::KittyHalfKA;
-use bullet_lib::game::inputs::SparseInputType;
 use crate::eval::NnueWeights;
 
 #[derive(Clone, Debug)]
@@ -101,13 +98,13 @@ pub struct NetworkDiagnostics {
 }
 
 impl NetworkDiagnostics {
-    pub fn new() -> Self {
+    pub fn new(h1_size: usize) -> Self {
         Self {
             total_positions: 0,
             accum_stm: LayerDiagnostics::new(256),
             accum_ntm: LayerDiagnostics::new(256),
             accum_combined: LayerDiagnostics::new(256),
-            l1: LayerDiagnostics::new(32),
+            l1: LayerDiagnostics::new(h1_size),
             l2: LayerDiagnostics::new(32),
         }
     }
@@ -128,8 +125,9 @@ pub fn analyze_weights(
     positions_per_pack: usize,
 ) -> io::Result<NetworkDiagnostics> {
     let weights = NnueWeights::load_from_file(weights_path)?;
+    let h1_size = weights.hidden1_size;
 
-    let mut full_diag = NetworkDiagnostics::new();
+    let mut full_diag = NetworkDiagnostics::new(h1_size);
     let batch_size = 65_536;
 
     for (pack_idx, pack_path) in pack_paths.iter().enumerate() {
@@ -137,34 +135,22 @@ pub fn analyze_weights(
             continue;
         }
 
-        let pack_name = pack_path.file_name().unwrap_or_default().to_string_lossy();
-        println!("Sampling pack {}/{} ('{}')...", pack_idx + 1, pack_paths.len(), pack_name);
+        print!("\rSampling eval packs: {}/{}...", pack_idx + 1, pack_paths.len());
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
 
-        let loader = DataLoader::<ChessBoard>::new(pack_path, 64)?;
-        let mut processed_in_pack = 0;
-
-        loader.map_batches(batch_size, |batch| {
-            if processed_in_pack >= positions_per_pack {
-                return;
-            }
-
-            let slice = if processed_in_pack + batch.len() > positions_per_pack {
-                &batch[..positions_per_pack - processed_in_pack]
-            } else {
-                batch
-            };
-
-            let batch_diag = slice
+        crate::convert::for_each_board_in_pack(pack_path, batch_size, positions_per_pack, |batch| {
+            let batch_diag = batch
                 .par_chunks(4096)
                 .map(|chunk| {
-                    let mut chunk_diag = NetworkDiagnostics::new();
+                    let mut chunk_diag = NetworkDiagnostics::new(h1_size);
                     chunk_diag.total_positions = chunk.len() as u64;
 
                     for board in chunk {
                         let mut stm_features = Vec::with_capacity(32);
                         let mut ntm_features = Vec::with_capacity(32);
 
-                        KittyHalfKA.map_features(board, |stm, ntm| {
+                        crate::inputs::map_halfka_hm(board, |stm, ntm| {
                             stm_features.push(stm);
                             ntm_features.push(ntm);
                         });
@@ -208,50 +194,56 @@ pub fn analyze_weights(
                             chunk_diag.accum_combined.neurons[i].record(max_pre, max_act);
                         }
 
-                        // 2. Hidden Layer 1 forward pass (512 -> 32)
-                        let mut h1 = [0.0f32; 32];
-                        for i in 0..32 {
-                            let row = &weights.l1w[i * 512..(i + 1) * 512];
+                        // 2. Hidden Layer 1 forward pass (256 pairwise -> h1_size)
+                        let mut h1 = vec![0.0f32; h1_size];
+                        let mut pairwise = [0.0f32; 256];
+                        for i in 0..128 {
+                            pairwise[i] = combined[i] * combined[128 + i];
+                            pairwise[128 + i] = combined[256 + i] * combined[384 + i];
+                        }
+                        for (i, h) in h1.iter_mut().enumerate() {
+                            let row = &weights.l1w[i * 256..(i + 1) * 256];
                             let mut dot = weights.l1b[i];
-                            for (c, &w) in combined.iter().zip(row) {
+                            for (c, &w) in pairwise.iter().zip(row) {
                                 dot += c * w;
                             }
 
                             let c = dot.clamp(0.0, 1.0);
                             let act = c * c;
 
-                            h1[i] = act;
+                            *h = act;
                             chunk_diag.l1.neurons[i].record(dot, act);
                         }
 
-                        // 3. Hidden Layer 2 forward pass (32 -> 32)
+                        // 3. Hidden Layer 2 forward pass (h1_size -> 32)
                         let mut h2 = [0.0f32; 32];
-                        for j in 0..32 {
-                            let row = &weights.l2w[j * 32..(j + 1) * 32];
+                        for (j, h) in h2.iter_mut().enumerate() {
+                            let row = &weights.l2w[j * h1_size..(j + 1) * h1_size];
                             let mut dot = weights.l2b[j];
-                            for (h, &w) in h1.iter().zip(row) {
-                                dot += h * w;
+                            for (val, &w) in h1.iter().zip(row) {
+                                dot += val * w;
                             }
 
                             let c = dot.clamp(0.0, 1.0);
                             let act = c * c;
 
-                            h2[j] = act;
+                            *h = act;
                             chunk_diag.l2.neurons[j].record(dot, act);
                         }
                     }
 
                     chunk_diag
                 })
-                .reduce(NetworkDiagnostics::new, |mut a, b| {
+                .reduce(|| NetworkDiagnostics::new(h1_size), |mut a, b| {
                     a.merge(&b);
                     a
                 });
 
             full_diag.merge(&batch_diag);
-            processed_in_pack += slice.len();
-        });
+            true
+        })?;
     }
+    println!();
 
     Ok(full_diag)
 }

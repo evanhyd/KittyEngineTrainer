@@ -1,10 +1,7 @@
 use std::io;
 use std::path::Path;
 use rayon::prelude::*;
-use bulletformat::{BulletFormat, ChessBoard, DataLoader};
-
-use crate::inputs::KittyHalfKA;
-use bullet_lib::game::inputs::SparseInputType;
+use bulletformat::{BulletFormat, ChessBoard};
 
 const MAGIC_V6: &[u8; 8] = b"NNUESGD6";
 
@@ -71,23 +68,36 @@ impl ErrorStats {
 }
 
 pub struct NnueWeights {
+    #[allow(dead_code)]
+    pub num_inputs: usize,
+    #[allow(dead_code)]
+    pub l1_input_size: usize,
+    pub hidden1_size: usize,
+    pub hidden2_size: usize,
+    pub num_buckets: usize,
+    #[allow(dead_code)]
+    pub is_pairwise: bool,
     pub l0b: Vec<f32>,
     pub l0w: Vec<f32>,
-    pub l1b: [f32; 32],
+    pub l1b: Vec<f32>,
     pub l1w: Vec<f32>,
-    pub l2b: [f32; 32],
+    pub l2b: Vec<f32>,
     pub l2w: Vec<f32>,
-    pub l3b: [f32; 8],
+    pub l3b: Vec<f32>,
     pub l3w: Vec<f32>,
 }
 
 impl NnueWeights {
     pub fn load_from_file(path: &Path) -> io::Result<Self> {
         let bytes = std::fs::read(path)?;
-        if bytes.len() != 25_237_864 {
+        if bytes.len() != crate::config::CHECKPOINT_SIZE as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Expected 25,237,864 bytes, got {}", bytes.len()),
+                format!(
+                    "Expected {} bytes (HalfKAv2 Pairwise 8-Bucket), got {}",
+                    crate::config::CHECKPOINT_SIZE,
+                    bytes.len()
+                ),
             ));
         }
 
@@ -97,6 +107,13 @@ impl NnueWeights {
                 "Invalid NNUESGD signature (expected NNUESGD6)",
             ));
         }
+
+        let num_inputs = crate::config::INPUT_SIZE; // 24_576
+        let l1_input_size = crate::config::PAIRWISE_SIZE; // 256
+        let hidden1_size = crate::config::HIDDEN1_SIZE; // 64
+        let hidden2_size = crate::config::HIDDEN2_SIZE; // 32
+        let num_buckets = crate::config::NUM_OUTPUT_BUCKETS; // 8
+        let is_pairwise = true;
 
         // Header is 72 bytes (8 magic + 40 dimensions + 24 progress)
         let payload_floats: &[f32] = unsafe {
@@ -111,30 +128,42 @@ impl NnueWeights {
         let l0b = payload_floats[offset..offset + 256].to_vec();
         offset += 256;
 
-        let l0w = payload_floats[offset..offset + 24_576 * 256].to_vec();
-        offset += 24_576 * 256;
+        let l0w = payload_floats[offset..offset + num_inputs * 256].to_vec();
+        offset += num_inputs * 256;
 
-        let mut l1b = [0.0f32; 32];
-        l1b.copy_from_slice(&payload_floats[offset..offset + 32]);
-        offset += 32;
+        let l1b = payload_floats[offset..offset + hidden1_size].to_vec();
+        offset += hidden1_size;
 
-        let l1w = payload_floats[offset..offset + 32 * 512].to_vec();
-        offset += 32 * 512;
+        let l1w = payload_floats[offset..offset + hidden1_size * l1_input_size].to_vec();
+        offset += hidden1_size * l1_input_size;
 
-        let mut l2b = [0.0f32; 32];
-        l2b.copy_from_slice(&payload_floats[offset..offset + 32]);
-        offset += 32;
+        let l2b = payload_floats[offset..offset + hidden2_size].to_vec();
+        offset += hidden2_size;
 
-        let l2w = payload_floats[offset..offset + 32 * 32].to_vec();
-        offset += 32 * 32;
+        let l2w = payload_floats[offset..offset + hidden2_size * hidden1_size].to_vec();
+        offset += hidden2_size * hidden1_size;
 
-        let mut l3b = [0.0f32; 8];
-        l3b.copy_from_slice(&payload_floats[offset..offset + 8]);
-        offset += 8;
+        let l3b = payload_floats[offset..offset + num_buckets].to_vec();
+        offset += num_buckets;
 
-        let l3w = payload_floats[offset..offset + 8 * 32].to_vec();
+        let l3w = payload_floats[offset..offset + num_buckets * hidden2_size].to_vec();
 
-        Ok(Self { l0b, l0w, l1b, l1w, l2b, l2w, l3b, l3w })
+        Ok(Self {
+            num_inputs,
+            l1_input_size,
+            hidden1_size,
+            hidden2_size,
+            num_buckets,
+            is_pairwise,
+            l0b,
+            l0w,
+            l1b,
+            l1w,
+            l2b,
+            l2w,
+            l3b,
+            l3w,
+        })
     }
 
     #[inline(always)]
@@ -147,7 +176,7 @@ impl NnueWeights {
         let mut stm_features = Vec::with_capacity(32);
         let mut ntm_features = Vec::with_capacity(32);
 
-        KittyHalfKA.map_features(board, |stm, ntm| {
+        crate::inputs::map_halfka_hm(board, |stm, ntm| {
             stm_features.push(stm);
             ntm_features.push(ntm);
         });
@@ -168,43 +197,50 @@ impl NnueWeights {
             }
         }
 
-        let mut combined = [0.0f32; 512];
-        for i in 0..256 {
-            combined[i] = Self::act(stm_acc[i]);
-            combined[256 + i] = Self::act(ntm_acc[i]);
+        // Vectorized pairwise interaction (Hadamard product) within each perspective:
+        let mut pairwise = [0.0f32; 256];
+        for i in 0..128 {
+            pairwise[i] = Self::act(stm_acc[i]) * Self::act(stm_acc[128 + i]);
+            pairwise[128 + i] = Self::act(ntm_acc[i]) * Self::act(ntm_acc[128 + i]);
         }
 
-        let mut h1 = [0.0f32; 32];
-        for i in 0..32 {
-            let row = &self.l1w[i * 512..(i + 1) * 512];
+        let mut h1 = vec![0.0f32; self.hidden1_size];
+        for (i, h) in h1.iter_mut().enumerate() {
+            let row = &self.l1w[i * 256..(i + 1) * 256];
             let mut dot = self.l1b[i];
-            for (c, &w) in combined.iter().zip(row) {
+            for (c, &w) in pairwise.iter().zip(row) {
                 dot += c * w;
             }
-            h1[i] = Self::act(dot);
+            *h = Self::act(dot);
         }
 
-        let mut h2 = [0.0f32; 32];
-        for i in 0..32 {
-            let row = &self.l2w[i * 32..(i + 1) * 32];
+        let mut h2 = vec![0.0f32; self.hidden2_size];
+        for (i, h) in h2.iter_mut().enumerate() {
+            let row = &self.l2w[i * self.hidden1_size..(i + 1) * self.hidden1_size];
             let mut dot = self.l2b[i];
-            for (h, &w) in h1.iter().zip(row) {
-                dot += h * w;
+            for (val, &w) in h1.iter().zip(row) {
+                dot += val * w;
             }
-            h2[i] = Self::act(dot);
+            *h = Self::act(dot);
         }
 
-        // Material count output bucketing (0..7) matching Bullet MaterialCount<8> and KittyEngine
-        let occ = board.occ().count_ones() as usize;
-        let bucket = ((occ.saturating_sub(2)) / 4).min(7);
+        // Major and minor piece output bucketing (0..7) matching KittyEngine MajorMinorCount
+        let mut mm_count = 0;
+        for (piece, _) in board.into_iter() {
+            let pt = piece & 7;
+            if (1..=4).contains(&pt) {
+                mm_count += 1;
+            }
+        }
+        let bucket = std::cmp::min(self.num_buckets - 1, mm_count / 2);
 
-        let mut raw_eval = self.l3b[bucket];
-        let b_weights = &self.l3w[bucket * 32..(bucket + 1) * 32];
-        for (h, &w) in h2.iter().zip(b_weights) {
-            raw_eval += h * w;
+        let mut cp = self.l3b[bucket];
+        let out_row = &self.l3w[bucket * self.hidden2_size..(bucket + 1) * self.hidden2_size];
+        for (val, &w) in h2.iter().zip(out_row) {
+            cp += val * w;
         }
 
-        raw_eval
+        cp
     }
 
     pub fn evaluate(&self, board: &ChessBoard) -> f32 {
@@ -233,21 +269,8 @@ pub fn evaluate_checkpoint_packs(
             continue;
         }
 
-        let loader = DataLoader::<ChessBoard>::new(pack_path, 64)?;
-        let mut evaluated_in_pack = 0;
-
-        loader.map_batches(batch_size, |batch| {
-            if evaluated_in_pack >= positions_per_pack {
-                return;
-            }
-
-            let slice = if evaluated_in_pack + batch.len() > positions_per_pack {
-                &batch[..positions_per_pack - evaluated_in_pack]
-            } else {
-                batch
-            };
-
-            let (batch_overall, batch_non_mate, batch_mate) = slice
+        crate::convert::for_each_board_in_pack(pack_path, batch_size, positions_per_pack, |batch| {
+            let (batch_overall, batch_non_mate, batch_mate) = batch
                 .par_chunks(8192)
                 .map(|chunk| {
                     let mut chunk_overall = ErrorStats::default();
@@ -289,34 +312,20 @@ pub fn evaluate_checkpoint_packs(
             overall.merge(&batch_overall);
             non_mate.merge(&batch_non_mate);
             mate.merge(&batch_mate);
-
-            evaluated_in_pack += slice.len();
-        });
+            true
+        })?;
 
         print!(
-            "\rPack {}/{} ('{}'): evaluated {} pos | Total across all packs: {} pos...",
+            "\r  Evaluating validation set ({}/{} packs)...",
             pack_idx + 1,
-            num_packs,
-            pack_path.file_name().unwrap_or_default().to_string_lossy(),
-            evaluated_in_pack,
-            overall.count
+            num_packs
         );
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
 
-    println!();
+    print!("\r                                                      \r");
     Ok((overall, non_mate, mate))
-}
-
-#[allow(dead_code)]
-pub fn evaluate_checkpoint_file(
-    weights_path: &Path,
-    data_path: &Path,
-    positions_to_eval: usize,
-    wdl: f32,
-) -> io::Result<(ErrorStats, ErrorStats, ErrorStats)> {
-    evaluate_checkpoint_packs(weights_path, &[data_path.to_path_buf()], positions_to_eval, wdl)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -387,10 +396,6 @@ impl InversionStats {
 
 pub fn board_to_fen(board: &ChessBoard) -> String {
     let mut grid = [' '; 64];
-    let our_k = board.our_ksq() as usize;
-    let opp_k = board.opp_ksq() as usize;
-    grid[our_k] = 'K';
-    grid[opp_k] = 'k';
 
     for (piece, square) in board.into_iter() {
         let piece_type = (piece & 7) as usize;
@@ -401,6 +406,7 @@ pub fn board_to_fen(board: &ChessBoard) -> String {
             2 => if is_enemy { 'b' } else { 'B' },
             3 => if is_enemy { 'r' } else { 'R' },
             4 => if is_enemy { 'q' } else { 'Q' },
+            5 => if is_enemy { 'k' } else { 'K' },
             _ => continue,
         };
         grid[square as usize] = ch;
@@ -449,21 +455,10 @@ pub fn evaluate_inversions(
             continue;
         }
 
-        let loader = DataLoader::<ChessBoard>::new(pack_path, 64)?;
         let mut evaluated_in_pack = 0;
 
-        loader.map_batches(batch_size, |batch| {
-            if positions_per_pack > 0 && evaluated_in_pack >= positions_per_pack {
-                return;
-            }
-
-            let slice = if positions_per_pack > 0 && evaluated_in_pack + batch.len() > positions_per_pack {
-                &batch[..positions_per_pack - evaluated_in_pack]
-            } else {
-                batch
-            };
-
-            let batch_stats = slice
+        crate::convert::for_each_board_in_pack(pack_path, batch_size, positions_per_pack, |batch| {
+            let batch_stats = batch
                 .par_chunks(8192)
                 .map(|chunk| {
                     let mut chunk_stats = InversionStats::default();
@@ -502,11 +497,10 @@ pub fn evaluate_inversions(
                         if err >= 800.0 { chunk_stats.err_ge_800 += 1; }
                         if err >= 1200.0 { chunk_stats.err_ge_1200 += 1; }
 
-                        if opposite_sign && t_abs >= 300.0 && t_abs < 2000.0 && p_abs >= 300.0 && err >= 600.0 {
-                            if chunk_stats.worst_inversions.len() < 5 {
+                        if opposite_sign && (300.0..2000.0).contains(&t_abs) && p_abs >= 300.0 && err >= 600.0
+                            && chunk_stats.worst_inversions.len() < 5 {
                                 chunk_stats.worst_inversions.push((target_cp, pred_cp, err, board_to_fen(board)));
                             }
-                        }
                     }
 
                     chunk_stats
@@ -520,8 +514,9 @@ pub fn evaluate_inversions(
                 );
 
             stats.merge(&batch_stats);
-            evaluated_in_pack += slice.len();
-        });
+            evaluated_in_pack += batch.len();
+            true
+        })?;
 
         print!(
             "\rPack {}/{} ('{}'): evaluated {} pos | Total across all packs: {} pos...",
@@ -537,4 +532,17 @@ pub fn evaluate_inversions(
 
     println!();
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_board_to_fen() {
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 | 0 | 0.5";
+        let board = fen.parse::<ChessBoard>().unwrap();
+        let gen_fen = board_to_fen(&board);
+        assert_eq!(gen_fen, "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1");
+    }
 }

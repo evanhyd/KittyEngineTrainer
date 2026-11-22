@@ -61,7 +61,6 @@ pub enum SprtDecision {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SprtMatchResult {
     pub decision: SprtDecision,
     pub wins: usize,
@@ -326,18 +325,13 @@ pub fn run_sprt_match(
             Err(_) => break,
         };
 
-        // Parse finished game
-        if line.starts_with("Finished game") {
-            println!("  {}", line);
-        }
-
         // Parse live score: "Score of Candidate vs Champion: 10 - 5 - 15  [0.583] 30"
         if line.starts_with("Score of Candidate vs Champion:") {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() > 1 {
                 let tokens: Vec<&str> = parts[1].split_whitespace().collect();
-                if tokens.len() >= 5 {
-                    if let (Ok(w), Ok(l), Ok(d)) = (
+                if tokens.len() >= 5
+                    && let (Ok(w), Ok(l), Ok(d)) = (
                         tokens[0].parse::<usize>(),
                         tokens[2].parse::<usize>(),
                         tokens[4].parse::<usize>(),
@@ -347,21 +341,19 @@ pub fn run_sprt_match(
                         draws = d;
                         total_games = w + l + d;
                     }
-                }
             }
             println!("  📊 {}", line);
         }
 
         // Parse Elo difference: "Elo difference: 14.5 +/- 8.2, LOS: ..."
-        if line.contains("Elo difference:") {
-            if let Some(pos) = line.find("Elo difference:") {
+        if line.contains("Elo difference:")
+            && let Some(pos) = line.find("Elo difference:") {
                 let rest = &line[pos + 15..];
                 let tokens: Vec<&str> = rest.split_whitespace().collect();
-                if !tokens.is_empty() {
-                    if let Ok(val) = tokens[0].parse::<f64>() {
+                if !tokens.is_empty()
+                    && let Ok(val) = tokens[0].parse::<f64>() {
                         elo_diff = Some(val);
                     }
-                }
                 if tokens.len() >= 3 && tokens[1] == "+/-" {
                     let err_str = tokens[2].trim_end_matches(',');
                     if let Ok(err) = err_str.parse::<f64>() {
@@ -369,7 +361,6 @@ pub fn run_sprt_match(
                     }
                 }
             }
-        }
 
         // Parse SPRT stats: "SPRT: llr 0.0269 (0.9%), lbound -2.94, ubound 2.94"
         if line.contains("SPRT:") {
@@ -377,11 +368,10 @@ pub fn run_sprt_match(
             // Parse LLR
             if let Some(llr_pos) = line.find("llr ") {
                 let sub = &line[llr_pos + 4..];
-                if let Some(end) = sub.find(|c: char| c == ' ' || c == '(') {
-                    if let Ok(v) = sub[..end].parse::<f64>() {
+                if let Some(end) = sub.find([' ', '('])
+                    && let Ok(v) = sub[..end].parse::<f64>() {
                         llr = Some(v);
                     }
-                }
             }
             // Parse lbound
             if let Some(lb_pos) = line.find("lbound ") {
@@ -403,9 +393,9 @@ pub fn run_sprt_match(
 
         // Check for hypothesis acceptance
         let lower = line.to_lowercase();
-        if lower.contains("accept h1") || lower.contains("candidate is stronger") {
+        if lower.contains("accept h1") || lower.contains("h1 was accepted") || lower.contains("candidate is stronger") {
             explicit_decision = Some(SprtDecision::AcceptedH1);
-        } else if lower.contains("accept h0") || lower.contains("candidate is not stronger") || lower.contains("champion is stronger") {
+        } else if lower.contains("accept h0") || lower.contains("h0 was accepted") || lower.contains("candidate is not stronger") || lower.contains("champion is stronger") {
             explicit_decision = Some(SprtDecision::AcceptedH0);
         }
     }
