@@ -3,7 +3,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use bulletformat::{BulletFormat, ChessBoard};
 
-const MAGIC_V6: &[u8; 8] = b"NNUESGD6";
+const MAGIC_V8: &[u8; 8] = b"NNUESGD8";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ErrorStats {
@@ -70,13 +70,10 @@ impl ErrorStats {
 pub struct NnueWeights {
     #[allow(dead_code)]
     pub num_inputs: usize,
-    #[allow(dead_code)]
-    pub l1_input_size: usize,
+    pub accum_size: usize,
     pub hidden1_size: usize,
     pub hidden2_size: usize,
     pub num_buckets: usize,
-    #[allow(dead_code)]
-    pub is_pairwise: bool,
     pub l0b: Vec<f32>,
     pub l0w: Vec<f32>,
     pub l1b: Vec<f32>,
@@ -94,67 +91,54 @@ impl NnueWeights {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Expected {} bytes (HalfKAv2 Pairwise 8-Bucket), got {}",
+                    "Expected {} bytes (HalfKA-16 768->[16->32->1]x8), got {}",
                     crate::config::CHECKPOINT_SIZE,
                     bytes.len()
                 ),
             ));
         }
 
-        if &bytes[0..8] != MAGIC_V6 {
+        if &bytes[0..8] != MAGIC_V8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid NNUESGD signature (expected NNUESGD6)",
+                "Invalid NNUESGD signature (expected NNUESGD8)",
             ));
         }
 
-        let num_inputs = crate::config::INPUT_SIZE; // 24_576
-        let l1_input_size = crate::config::PAIRWISE_SIZE; // 256
-        let hidden1_size = crate::config::HIDDEN1_SIZE; // 64
-        let hidden2_size = crate::config::HIDDEN2_SIZE; // 32
-        let num_buckets = crate::config::NUM_OUTPUT_BUCKETS; // 8
-        let is_pairwise = true;
+        let num_inputs = crate::config::INPUT_SIZE;
+        let accum_size = crate::config::ACCUM_SIZE;
+        let pairwise_size = crate::config::PAIRWISE_SIZE;
+        let hidden1_size = crate::config::HIDDEN1_SIZE;
+        let hidden2_size = crate::config::HIDDEN2_SIZE;
+        let num_buckets = crate::config::NUM_OUTPUT_BUCKETS;
 
-        // Header is 72 bytes (8 magic + 40 dimensions + 24 progress)
         let payload_floats: &[f32] = unsafe {
-            std::slice::from_raw_parts(
-                bytes[72..].as_ptr() as *const f32,
-                (bytes.len() - 72) / 4,
-            )
+            std::slice::from_raw_parts(bytes[72..].as_ptr() as *const f32, (bytes.len() - 72) / 4)
         };
 
         let mut offset = 0;
-
-        let l0b = payload_floats[offset..offset + 256].to_vec();
-        offset += 256;
-
-        let l0w = payload_floats[offset..offset + num_inputs * 256].to_vec();
-        offset += num_inputs * 256;
-
-        let l1b = payload_floats[offset..offset + hidden1_size].to_vec();
-        offset += hidden1_size;
-
-        let l1w = payload_floats[offset..offset + hidden1_size * l1_input_size].to_vec();
-        offset += hidden1_size * l1_input_size;
-
-        let l2b = payload_floats[offset..offset + hidden2_size].to_vec();
-        offset += hidden2_size;
-
-        let l2w = payload_floats[offset..offset + hidden2_size * hidden1_size].to_vec();
-        offset += hidden2_size * hidden1_size;
-
+        let l0b = payload_floats[offset..offset + accum_size].to_vec();
+        offset += accum_size;
+        let l0w = payload_floats[offset..offset + num_inputs * accum_size].to_vec();
+        offset += num_inputs * accum_size;
+        let l1b = payload_floats[offset..offset + num_buckets * hidden1_size].to_vec();
+        offset += num_buckets * hidden1_size;
+        let l1w = payload_floats[offset..offset + num_buckets * hidden1_size * pairwise_size].to_vec();
+        offset += num_buckets * hidden1_size * pairwise_size;
+        let l2b = payload_floats[offset..offset + num_buckets * hidden2_size].to_vec();
+        offset += num_buckets * hidden2_size;
+        let l2w = payload_floats[offset..offset + num_buckets * hidden2_size * hidden1_size].to_vec();
+        offset += num_buckets * hidden2_size * hidden1_size;
         let l3b = payload_floats[offset..offset + num_buckets].to_vec();
         offset += num_buckets;
-
         let l3w = payload_floats[offset..offset + num_buckets * hidden2_size].to_vec();
 
         Ok(Self {
             num_inputs,
-            l1_input_size,
+            accum_size,
             hidden1_size,
             hidden2_size,
             num_buckets,
-            is_pairwise,
             l0b,
             l0w,
             l1b,
@@ -167,7 +151,12 @@ impl NnueWeights {
     }
 
     #[inline(always)]
-    fn act(x: f32) -> f32 {
+    fn crelu(x: f32) -> f32 {
+        x.clamp(0.0, 1.0)
+    }
+
+    #[inline(always)]
+    fn screlu(x: f32) -> f32 {
         let c = x.clamp(0.0, 1.0);
         c * c
     }
@@ -181,9 +170,14 @@ impl NnueWeights {
             ntm_features.push(ntm);
         });
 
+        let n = self.accum_size;
+        let half = n / 2;
+        let h1_n = self.hidden1_size;
+        let h2_n = self.hidden2_size;
+
         let mut stm_acc = self.l0b.clone();
         for &feat in &stm_features {
-            let row = &self.l0w[feat * 256..(feat + 1) * 256];
+            let row = &self.l0w[feat * n..(feat + 1) * n];
             for (acc, &w) in stm_acc.iter_mut().zip(row) {
                 *acc += w;
             }
@@ -191,56 +185,52 @@ impl NnueWeights {
 
         let mut ntm_acc = self.l0b.clone();
         for &feat in &ntm_features {
-            let row = &self.l0w[feat * 256..(feat + 1) * 256];
+            let row = &self.l0w[feat * n..(feat + 1) * n];
             for (acc, &w) in ntm_acc.iter_mut().zip(row) {
                 *acc += w;
             }
         }
 
-        // Vectorized pairwise interaction (Hadamard product) within each perspective:
-        let mut pairwise = [0.0f32; 256];
-        for i in 0..128 {
-            pairwise[i] = Self::act(stm_acc[i]) * Self::act(stm_acc[128 + i]);
-            pairwise[128 + i] = Self::act(ntm_acc[i]) * Self::act(ntm_acc[128 + i]);
+        let mut pairwise = vec![0.0f32; n];
+        for i in 0..half {
+            pairwise[i] = Self::crelu(stm_acc[i]) * Self::crelu(stm_acc[half + i]);
+            pairwise[half + i] = Self::crelu(ntm_acc[i]) * Self::crelu(ntm_acc[half + i]);
         }
 
-        let mut h1 = vec![0.0f32; self.hidden1_size];
-        for (i, h) in h1.iter_mut().enumerate() {
-            let row = &self.l1w[i * 256..(i + 1) * 256];
-            let mut dot = self.l1b[i];
-            for (c, &w) in pairwise.iter().zip(row) {
-                dot += c * w;
+        let occ = board.occ().count_ones() as usize;
+        let bucket = ((occ.saturating_sub(2)) / 4).min(self.num_buckets - 1);
+
+        let l1b_b = &self.l1b[bucket * h1_n..(bucket + 1) * h1_n];
+        let l1w_b = &self.l1w[bucket * h1_n * n..(bucket + 1) * h1_n * n];
+        let mut h1 = vec![0.0f32; h1_n];
+        for r in 0..h1_n {
+            let row = &l1w_b[r * n..(r + 1) * n];
+            let mut sum = l1b_b[r];
+            for (&p, &w) in pairwise.iter().zip(row) {
+                sum += p * w;
             }
-            *h = Self::act(dot);
+            h1[r] = Self::screlu(sum);
         }
 
-        let mut h2 = vec![0.0f32; self.hidden2_size];
-        for (i, h) in h2.iter_mut().enumerate() {
-            let row = &self.l2w[i * self.hidden1_size..(i + 1) * self.hidden1_size];
-            let mut dot = self.l2b[i];
-            for (val, &w) in h1.iter().zip(row) {
-                dot += val * w;
+        let l2b_b = &self.l2b[bucket * h2_n..(bucket + 1) * h2_n];
+        let l2w_b = &self.l2w[bucket * h2_n * h1_n..(bucket + 1) * h2_n * h1_n];
+        let mut h2 = vec![0.0f32; h2_n];
+        for r in 0..h2_n {
+            let row = &l2w_b[r * h1_n..(r + 1) * h1_n];
+            let mut sum = l2b_b[r];
+            for (&v, &w) in h1.iter().zip(row) {
+                sum += v * w;
             }
-            *h = Self::act(dot);
+            h2[r] = Self::screlu(sum);
         }
 
-        // Major and minor piece output bucketing (0..7) matching KittyEngine MajorMinorCount
-        let mut mm_count = 0;
-        for (piece, _) in board.into_iter() {
-            let pt = piece & 7;
-            if (1..=4).contains(&pt) {
-                mm_count += 1;
-            }
-        }
-        let bucket = std::cmp::min(self.num_buckets - 1, mm_count / 2);
-
-        let mut cp = self.l3b[bucket];
-        let out_row = &self.l3w[bucket * self.hidden2_size..(bucket + 1) * self.hidden2_size];
-        for (val, &w) in h2.iter().zip(out_row) {
-            cp += val * w;
+        let l3w_b = &self.l3w[bucket * h2_n..(bucket + 1) * h2_n];
+        let mut logit = self.l3b[bucket];
+        for (&v, &w) in h2.iter().zip(l3w_b) {
+            logit += v * w;
         }
 
-        cp
+        logit * 400.0
     }
 
     pub fn evaluate(&self, board: &ChessBoard) -> f32 {

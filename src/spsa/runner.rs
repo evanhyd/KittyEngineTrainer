@@ -111,6 +111,13 @@ impl CutechessRunner {
     ) -> Result<MatchResult, String> {
         let rounds = 1.max(total_games / 2);
 
+        if !self.config.engine_path.exists() {
+            return Err(format!(
+                "KittyEngine binary not found at: {}",
+                self.config.engine_path.display()
+            ));
+        }
+
         let clean_cutechess = to_clean_path(&self.config.cutechess_path);
         let clean_book = to_clean_path(&self.config.book_path);
 
@@ -229,6 +236,29 @@ impl CutechessRunner {
                     total, total_games, wins, losses, draws, pct, elo_diff, elo_error
                 );
                 let _ = std::io::stdout().flush();
+
+                // Early Mathematical Cutoff for SPSA iteration:
+                // If one side has won strictly more than half of total_games,
+                // the batch winner is mathematically irreversible!
+                let remaining = total_games.saturating_sub(total);
+                let min_check = (total_games / 3).max(10);
+                if total >= min_check {
+                    if wins > losses + remaining {
+                        println!(
+                            "\n  ⚡ Early Cutoff: Theta+ locked in irreversible lead ({}W vs max possible {}W with {} games left).",
+                            wins, losses + remaining, remaining
+                        );
+                        let _ = child.kill();
+                        break;
+                    } else if losses > wins + remaining {
+                        println!(
+                            "\n  ⚡ Early Cutoff: Theta- locked in irreversible lead ({}W vs max possible {}W with {} games left).",
+                            losses, wins + remaining, remaining
+                        );
+                        let _ = child.kill();
+                        break;
+                    }
+                }
             }
         }
 
@@ -236,7 +266,7 @@ impl CutechessRunner {
         println!();
 
         let total = wins + losses + draws;
-        if !status.success() || total == 0 {
+        if total == 0 {
             return Err(format!(
                 "Cutechess exited with status {} and 0 games played. Check Cutechess path and configuration.",
                 status
@@ -276,6 +306,13 @@ impl CutechessRunner {
         max_rounds: usize,
         pgn_path: Option<&Path>,
     ) -> Result<SprtResult, String> {
+        if !self.config.engine_path.exists() {
+            return Err(format!(
+                "KittyEngine binary not found at: {}",
+                self.config.engine_path.display()
+            ));
+        }
+
         let clean_cutechess = to_clean_path(&self.config.cutechess_path);
         let clean_book = to_clean_path(&self.config.book_path);
 
@@ -437,6 +474,29 @@ impl CutechessRunner {
                     total, max_rounds * 2, wins, losses, draws, pct, elo_diff, elo_error, llr, lbound, ubound
                 );
                 let _ = std::io::stdout().flush();
+
+                // Early Mathematical Cutoff for Candidate vs Baseline:
+                let max_games = max_rounds * 2;
+                let remaining = max_games.saturating_sub(total);
+                if total >= 20 {
+                    if wins > losses + remaining {
+                        println!(
+                            "\n  ⚡ Early Cutoff: Promotion mathematically guaranteed (Candidate +{}W vs max possible {}W with {} games left).",
+                            wins, losses + remaining, remaining
+                        );
+                        explicit_decision = Some(SprtDecisionType::AcceptedH1);
+                        let _ = child.kill();
+                        break;
+                    } else if wins + remaining <= losses {
+                        println!(
+                            "\n  ⚡ Early Cutoff: Defeating baseline mathematically impossible (max possible {}W vs {}L with {} games left).",
+                            wins + remaining, losses, remaining
+                        );
+                        explicit_decision = Some(SprtDecisionType::AcceptedH0);
+                        let _ = child.kill();
+                        break;
+                    }
+                }
             }
         }
 
@@ -444,7 +504,7 @@ impl CutechessRunner {
         println!();
 
         let total = wins + losses + draws;
-        if !status.success() || total == 0 {
+        if total == 0 {
             return Err(format!(
                 "Cutechess SPRT exited with status {} and 0 games played. Check Cutechess path and configuration.",
                 status

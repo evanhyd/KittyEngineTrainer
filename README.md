@@ -65,5 +65,5 @@ cargo run --release -- spsa
 
 ## ⚙️ Configuration Files
 
-- **`config.yaml`**: Training hyperparameters (learning rate, batch size, WDL distillation, save interval) and trainer SPRT settings.
-- **`spsa_settings.json`**: SPSA tuner settings (engine path, time control, concurrency, games per iteration, SPRT verification bounds).
+- **`config.yaml`**: Training hyperparameters (learning rate, batch size, WDL distillation, save interval) and trainer SPRT settings (`engine_name` resolved under `engine/`).
+- **`spsa_settings.json`**: SPSA tuner settings (`engine_name` resolved under `engine/`, time control, concurrency, games per iteration, SPRT verification bounds).

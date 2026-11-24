@@ -56,57 +56,57 @@ impl ParamDef {
 }
 
 pub const SEARCH_PARAMS: &[ParamDef] = &[
-    // Top-level (Active)
-    ParamDef::new("aspiration_window", "", ParamType::Int, 20.0, 250.0, 10.0, 100.0, true, 100.0),
-    ParamDef::new("aspiration_window_divisor", "", ParamType::Int, 2.0, 16.0, 1.0, 20.0, true, 5.0),
+    // Top-level (Aspiration window fixed as requested; improving_threshold active)
+    ParamDef::new("aspiration_window", "", ParamType::Int, 20.0, 250.0, 10.0, 100.0, false, 100.0),
+    ParamDef::new("aspiration_window_divisor", "", ParamType::Int, 2.0, 16.0, 1.0, 20.0, false, 5.0),
     ParamDef::new("improving_threshold", "", ParamType::Int, 0.0, 150.0, 6.0, 60.0, true, 40.0),
 
     // Reverse Futility Pruning (Static Null Move Pruning)
-    ParamDef::new("depth", "reverse_futility_pruning", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 3.0),
+    ParamDef::new("depth", "reverse_futility_pruning", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 3.0),
     ParamDef::new("multiplier", "reverse_futility_pruning", ParamType::Int, 30.0, 250.0, 15.0, 120.0, true, 100.0),
     ParamDef::new("base", "reverse_futility_pruning", ParamType::Int, -50.0, 100.0, 10.0, 80.0, true, 0.0),
     ParamDef::new("improving_bonus", "reverse_futility_pruning", ParamType::Int, 0.0, 100.0, 8.0, 60.0, true, 30.0),
 
     // Null Move Pruning
-    ParamDef::new("depth", "null_move_pruning", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 4.0),
+    ParamDef::new("depth", "null_move_pruning", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 4.0),
     ParamDef::new("base", "null_move_pruning", ParamType::Int, 1.0, 6.0, 1.0, 20.0, true, 3.0),
     ParamDef::new("depth_divisor", "null_move_pruning", ParamType::Int, 2.0, 12.0, 1.0, 20.0, true, 6.0),
     ParamDef::new("eval_divisor", "null_move_pruning", ParamType::Int, 50.0, 500.0, 25.0, 200.0, true, 200.0),
     ParamDef::new("max_eval_bonus", "null_move_pruning", ParamType::Int, 0.0, 6.0, 1.0, 16.0, true, 2.0),
 
     // Futility Pruning
-    ParamDef::new("depth", "futility_pruning", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 3.0),
+    ParamDef::new("depth", "futility_pruning", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 3.0),
     ParamDef::new("multiplier", "futility_pruning", ParamType::Int, 30.0, 250.0, 15.0, 120.0, true, 100.0),
     ParamDef::new("base", "futility_pruning", ParamType::Int, -50.0, 100.0, 10.0, 80.0, true, 0.0),
     ParamDef::new("improving_bonus", "futility_pruning", ParamType::Int, 0.0, 80.0, 8.0, 60.0, true, 20.0),
 
     // SEE Pruning
-    ParamDef::new("depth", "see_pruning", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 3.0),
+    ParamDef::new("depth", "see_pruning", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 3.0),
     ParamDef::new("multiplier", "see_pruning", ParamType::Int, -250.0, -30.0, 15.0, 120.0, true, -100.0),
     ParamDef::new("base", "see_pruning", ParamType::Int, -100.0, 50.0, 10.0, 80.0, true, 0.0),
 
     // Late Move Pruning
-    ParamDef::new("depth", "late_move_pruning", ParamType::Int, 1.0, 10.0, 1.0, 0.5, false, 4.0),
+    ParamDef::new("depth", "late_move_pruning", ParamType::Int, 1.0, 10.0, 1.0, 15.0, true, 4.0),
     ParamDef::new("multiplier", "late_move_pruning", ParamType::Int, 1.0, 6.0, 1.0, 20.0, true, 2.0),
     ParamDef::new("base", "late_move_pruning", ParamType::Int, 1.0, 16.0, 1.0, 20.0, true, 6.0),
 
     // History Pruning
-    ParamDef::new("depth", "history_pruning", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 3.0),
+    ParamDef::new("depth", "history_pruning", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 3.0),
     ParamDef::new("multiplier", "history_pruning", ParamType::Int, -600.0, -50.0, 30.0, 250.0, true, -300.0),
     ParamDef::new("base", "history_pruning", ParamType::Int, -1000.0, -100.0, 50.0, 375.0, true, -500.0),
 
     // Late Move Reductions (LMR)
-    ParamDef::new("depth", "late_move_reductions", ParamType::Int, 1.0, 6.0, 1.0, 0.5, false, 3.0),
+    ParamDef::new("depth", "late_move_reductions", ParamType::Int, 1.0, 6.0, 1.0, 15.0, true, 3.0),
     ParamDef::new("base", "late_move_reductions", ParamType::Float, 0.2, 2.0, 0.06, 0.50, true, 0.7844),
     ParamDef::new("divisor", "late_move_reductions", ParamType::Float, 1.0, 5.0, 0.15, 1.25, true, 2.69),
     ParamDef::new("history_k", "late_move_reductions", ParamType::Float, 0.0001, 0.01, 0.0003, 0.0025, true, 0.001),
     ParamDef::new("history_b", "late_move_reductions", ParamType::Float, -1.0, 1.0, 0.08, 0.60, true, 0.0),
 
     // Internal Iterative Deepening (IID)
-    ParamDef::new("depth", "internal_iterative_deepening", ParamType::Int, 1.0, 8.0, 1.0, 0.5, false, 4.0),
+    ParamDef::new("depth", "internal_iterative_deepening", ParamType::Int, 1.0, 8.0, 1.0, 15.0, true, 4.0),
 
     // Singular Extension
-    ParamDef::new("depth", "singular_extension", ParamType::Int, 4.0, 12.0, 1.0, 0.5, false, 8.0),
+    ParamDef::new("depth", "singular_extension", ParamType::Int, 4.0, 12.0, 1.0, 15.0, true, 8.0),
     ParamDef::new("depth_margin", "singular_extension", ParamType::Int, 1.0, 6.0, 1.0, 20.0, true, 3.0),
     ParamDef::new("multiplier", "singular_extension", ParamType::Int, 0.0, 10.0, 1.0, 20.0, true, 2.0),
     ParamDef::new("base", "singular_extension", ParamType::Int, 0.0, 80.0, 4.0, 50.0, true, 30.0),

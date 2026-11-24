@@ -5,7 +5,7 @@ pub mod deployer;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use params::{
@@ -16,26 +16,16 @@ use optimizer::SpsaOptimizer;
 use runner::{CutechessRunner, CutechessRunnerConfig, SprtDecisionType};
 use deployer::Deployer;
 
+use crate::config::{default_engine_name, resolve_engine_path, ENGINE_SEARCH_CONFIG_FILE};
+
 fn default_cutechess_path() -> String {
     "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe".to_string()
-}
-fn default_engine_path() -> String {
-    "engine/KittyEngineV5.exe".to_string()
-}
-fn default_engine_dir() -> String {
-    "engine".to_string()
 }
 fn default_engine_cli_flags() -> String {
     "--mode bullet".to_string()
 }
 fn default_book_path() -> String {
     "C:/Users/evanh/works/software/cutechess/book/book.bin".to_string()
-}
-fn default_desktop_config() -> String {
-    "C:/Users/evanh/Desktop/search_config.yaml".to_string()
-}
-fn default_local_config() -> String {
-    "engine/search_config.yaml".to_string()
 }
 fn default_tc() -> String {
     "10+1".to_string()
@@ -44,7 +34,7 @@ fn default_concurrency() -> usize {
     12
 }
 fn default_games_per_iter() -> usize {
-    80
+    24
 }
 fn default_book_depth() -> usize {
     1
@@ -80,10 +70,10 @@ fn default_sprt_beta() -> f64 {
     0.15
 }
 fn default_sprt_max_rounds() -> usize {
-    150
+    50
 }
 fn default_verify_interval() -> usize {
-    50
+    25
 }
 fn default_verify_win_rate() -> f64 {
     0.58
@@ -96,18 +86,12 @@ fn default_verify_elo() -> f64 {
 pub struct SpsaSettings {
     #[serde(default = "default_cutechess_path")]
     pub cutechess_path: String,
-    #[serde(default = "default_engine_path")]
-    pub engine_path: String,
-    #[serde(default = "default_engine_dir")]
-    pub engine_dir: String,
+    #[serde(default = "default_engine_name", alias = "engine_path", alias = "engine")]
+    pub engine_name: String,
     #[serde(default = "default_engine_cli_flags")]
     pub engine_cli_flags: String,
     #[serde(default = "default_book_path")]
     pub book_path: String,
-    #[serde(default = "default_desktop_config")]
-    pub desktop_config_path: String,
-    #[serde(default = "default_local_config")]
-    pub local_config_path: String,
     #[serde(default = "default_tc")]
     pub time_control: String,
     #[serde(default = "default_concurrency")]
@@ -150,12 +134,9 @@ impl Default for SpsaSettings {
     fn default() -> Self {
         Self {
             cutechess_path: default_cutechess_path(),
-            engine_path: default_engine_path(),
-            engine_dir: default_engine_dir(),
+            engine_name: default_engine_name(),
             engine_cli_flags: default_engine_cli_flags(),
             book_path: default_book_path(),
-            desktop_config_path: default_desktop_config(),
-            local_config_path: default_local_config(),
             time_control: default_tc(),
             concurrency: default_concurrency(),
             games_per_iteration: default_games_per_iter(),
@@ -179,19 +160,12 @@ impl Default for SpsaSettings {
 }
 
 impl SpsaSettings {
+    pub fn resolve_engine(&self) -> (PathBuf, PathBuf) {
+        resolve_engine_path(&self.engine_name)
+    }
+
     pub fn load_or_default() -> Self {
-        let json_paths = ["spsa_settings.json", "state/spsa_settings.json"];
-        for p in json_paths {
-            let path = Path::new(p);
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(path) {
-                    if let Ok(s) = serde_json::from_str::<Self>(&content) {
-                        return s;
-                    }
-                }
-            }
-        }
-        Self::default()
+        crate::config::TrainerConfig::load_or_default().spsa
     }
 }
 
@@ -215,20 +189,7 @@ impl SPSATuner {
         let _ = fs::create_dir_all(&logs_dir);
         let _ = fs::create_dir_all(&history_dir);
 
-        // Auto-detect engine executable if needed
-        let mut engine_path = PathBuf::from(&settings.engine_path);
-        let engine_dir = PathBuf::from(&settings.engine_dir);
-        if !engine_path.exists() && engine_dir.is_dir() {
-            if let Ok(entries) = fs::read_dir(&engine_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == "exe").unwrap_or(false) {
-                        engine_path = path;
-                        break;
-                    }
-                }
-            }
-        }
+        let (engine_path, engine_dir) = settings.resolve_engine();
 
         // Parse engine CLI args (filtering out --search_config to prevent collisions)
         let mut cli_args = Vec::new();
@@ -266,18 +227,11 @@ impl SPSATuner {
         };
 
         let runner = CutechessRunner::new(runner_cfg);
-        let deployer = Deployer::new(
-            &settings.desktop_config_path,
-            Some(&settings.local_config_path),
-            &history_dir,
-        );
+        let engine_config_path = PathBuf::from(ENGINE_SEARCH_CONFIG_FILE);
+        let deployer = Deployer::new(&engine_config_path, &history_dir);
 
-        // Load initial theta from state, or local config, or desktop config
-        let initial_cfg = if Path::new(&settings.local_config_path).exists() {
-            load_config_yaml(&settings.local_config_path).unwrap_or_default()
-        } else {
-            load_config_yaml(&settings.desktop_config_path).unwrap_or_default()
-        };
+        // Load initial theta from engine/search_config.yaml
+        let initial_cfg = load_config_yaml(&engine_config_path).unwrap_or_default();
 
         let state_path = state_dir.join("spsa_state.json");
         let optimizer = SpsaOptimizer::new(
@@ -456,7 +410,7 @@ impl SPSATuner {
         println!("  Batch Size        : {} games/iteration", self.settings.games_per_iteration);
         println!("  Time Control      : {}", self.runner.config.time_control);
         println!("  Concurrency       : {} threads", self.runner.config.concurrency);
-        println!("  Desktop Config    : {}", self.settings.desktop_config_path);
+        println!("  Engine Config     : {}", self.deployer.engine_config_path.display());
         println!("  Current Iteration : {}", self.optimizer.iteration);
         println!("  Total Games Played: {}", self.optimizer.total_games);
         println!("  (Press Ctrl+C to stop cleanly anytime with saved state)");
@@ -486,10 +440,11 @@ impl SPSATuner {
         println!("================================================================================");
         println!("  Current Iteration : {}", self.optimizer.iteration);
         println!("  Total Games Played: {}", self.optimizer.total_games);
+        println!("  Engine Name       : {}", self.settings.engine_name);
         println!("  Engine Binary     : {}", self.runner.config.engine_path.display());
         println!("  Engine Directory  : {}", self.runner.config.engine_dir.display());
         println!("  Engine CLI Args   : {:?}", self.runner.config.engine_cli_args);
-        println!("  Desktop Config    : {}", self.settings.desktop_config_path);
+        println!("  Engine Config     : {}", self.deployer.engine_config_path.display());
         println!("  Time Control      : {}", self.runner.config.time_control);
         println!("  Concurrency       : {} parallel games", self.runner.config.concurrency);
         println!();
@@ -529,14 +484,14 @@ impl SPSATuner {
     }
 
     pub fn verify(&mut self) -> Result<(), String> {
-        println!("Running manual SPRT verification of current SPSA parameters vs deployed desktop config...");
+        println!("Running manual SPRT verification of current SPSA parameters vs {}...", self.deployer.engine_config_path.display());
         let deployed_theta = self.deployer.get_deployed_config();
         self.verify_and_deploy_if_better(&deployed_theta)?;
         Ok(())
     }
 
     pub fn deploy_now(&mut self) -> Result<(), String> {
-        println!("Force deploying current SPSA parameters to desktop config...");
+        println!("Force deploying current SPSA parameters to {}...", self.deployer.engine_config_path.display());
         self.deployer.deploy(
             &self.optimizer.theta,
             "Manual force deployment via CLI",
@@ -548,7 +503,7 @@ impl SPSATuner {
 
     pub fn reset(&mut self, force: bool) -> Result<(), String> {
         if !force {
-            print!("Are you sure you want to reset SPSA state to desktop search_config.yaml? [y/N]: ");
+            print!("Are you sure you want to reset SPSA state to {}? [y/N]: ", self.deployer.engine_config_path.display());
             let _ = std::io::Write::flush(&mut std::io::stdout());
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input).is_ok() {
@@ -571,7 +526,7 @@ impl SPSATuner {
         self.optimizer.history.clear();
         self.optimizer.save_state()?;
 
-        println!("SPSA state reset cleanly to deployed desktop configuration.");
+        println!("SPSA state reset cleanly to {}.", self.deployer.engine_config_path.display());
         Ok(())
     }
 }
@@ -635,9 +590,9 @@ pub fn run_spsa_cli(args: &[String]) {
             println!("Commands:");
             println!("  run [--iterations N] [--games G]   Run continuous SPSA optimization loop");
             println!("  status                             Display parameter comparison & tuning telemetry");
-            println!("  verify                             Run SPRT verification against desktop config and deploy if superior");
-            println!("  deploy                             Force deploy current SPSA parameters to desktop");
-            println!("  reset [--force]                    Reset SPSA parameters to currently deployed desktop config");
+            println!("  verify                             Run SPRT verification against engine/search_config.yaml and deploy if superior");
+            println!("  deploy                             Force deploy current SPSA parameters to engine/search_config.yaml");
+            println!("  reset [--force]                    Reset SPSA parameters to engine/search_config.yaml");
         }
         other => {
             eprintln!("Unknown SPSA subcommand: '{}'", other);

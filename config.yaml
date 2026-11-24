@@ -1,16 +1,16 @@
 # ==============================================================================
-# KittyEngineTrainer Configuration (Optimized for High-Throughput Training)
+# KittyEngineTrainer Configuration (Unified NNUE, SPRT & SPSA)
 # ==============================================================================
 
-# Target 300 superbatches * 4096 batches * 16384 batch_size = ~20.13 Billion positions
-# (~1.0 epoch of clean filtered positions)
-superbatches: 600
+# Target 360 superbatches * 4096 batches * 16384 batch_size = ~24.16 Billion positions
+# (~1.0 full epoch over 24B unique filtered positions)
+superbatches: 360
 
 # WDL lambda distillation factor (92% deep search score, 8% game outcome)
 wdl: 0.08
 
-# Peak learning rate for Cosine Annealing decay
-lr: 0.00005
+# Peak learning rate for Cosine Annealing decay (tuned for 360 * 4096 = 1.47M AdamW steps on NNUESGD8)
+lr: 0.0003
 
 # Minimum learning rate at cycle completion
 min_lr: 0.000005
@@ -25,27 +25,24 @@ batches_per_superbatch: 4096
 # Evaluates in ~2-3 seconds instead of stalling training for minutes
 eval_positions_per_pack: 100000
 
-# Checkpoint & SPRT interval: every 15 superbatches (~every 1.0 Billion positions)
-# Evaluates 20 times total across the 300-sb run instead of interrupting every step!
-save_interval: 15
+# Checkpoint & SPRT interval: every 10 superbatches (~every 671M positions)
+save_interval: 10
 
-# Positive Bias Initialization (Layer 0, Layer 1, Layer 2)
-# L1=0.35, L2=0.55 provide robust safety cushion against SCReLU dying neurons
-bias_l0: 0.05
-bias_l1: 0.35
-bias_l2: 0.55
+# ==============================================================================
+# Unified Engine & Match Runner Settings (Shared by SPRT & SPSA)
+# ==============================================================================
+engine:
+  name: "KittyEngineV5.exe" # Resolved automatically inside ./engine/
+  args: "--mode bullet"
+  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
+  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
 
 # ==============================================================================
 # SPRT (Sequential Probability Ratio Test) Automated Verification
 # ==============================================================================
 sprt:
   enabled: true
-  cutechess_path: "C:/Users/evanh/works/software/cutechess/cutechess-cli.exe"
-  engine_path: "C:/Users/evanh/works/software/cutechess/engines/KittyEngineV5_experimental/KittyEngineV5.exe"
-  engine_args: "--mode bullet"
-  book_path: "C:/Users/evanh/works/software/cutechess/book/book.bin"
   book_depth: 1
-  # Fast bullet (2s + 0.02s) with 12 parallel games: finishes 40-60 games in ~45 seconds!
   time_control: "8+0.1"
   concurrency: 12
   max_rounds: 60
@@ -58,3 +55,26 @@ sprt:
   draw_score: 10
   resign_movecount: 6
   resign_score: 500
+
+# ==============================================================================
+# SPSA (Simultaneous Perturbation Stochastic Approximation) Search Tuner
+# ==============================================================================
+spsa:
+  time_control: "10+1"
+  concurrency: 12
+  games_per_iteration: 24
+  book_depth: 3
+  draw_movenumber: 40
+  draw_movecount: 20
+  draw_score: 10
+  resign_movecount: 10
+  resign_score: 500
+  max_moves: 200
+  sprt_elo0: 0.0
+  sprt_elo1: 20.0
+  sprt_alpha: 0.15
+  sprt_beta: 0.15
+  sprt_max_rounds: 50
+  verify_interval_iterations: 25
+  verify_win_rate_threshold: 0.58
+  verify_elo_threshold: 20.0

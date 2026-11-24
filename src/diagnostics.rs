@@ -52,19 +52,11 @@ impl NeuronActivity {
     }
 
     pub fn firing_rate(&self) -> f64 {
-        if self.count > 0 {
-            (self.fires as f64 / self.count as f64) * 100.0
-        } else {
-            0.0
-        }
+        if self.count > 0 { (self.fires as f64 / self.count as f64) * 100.0 } else { 0.0 }
     }
 
     pub fn mean_activation(&self) -> f64 {
-        if self.count > 0 {
-            self.sum_act / self.count as f64
-        } else {
-            0.0
-        }
+        if self.count > 0 { self.sum_act / self.count as f64 } else { 0.0 }
     }
 }
 
@@ -75,9 +67,7 @@ pub struct LayerDiagnostics {
 
 impl LayerDiagnostics {
     pub fn new(size: usize) -> Self {
-        Self {
-            neurons: vec![NeuronActivity::default(); size],
-        }
+        Self { neurons: vec![NeuronActivity::default(); size] }
     }
 
     pub fn merge(&mut self, other: &Self) {
@@ -90,29 +80,23 @@ impl LayerDiagnostics {
 #[derive(Clone, Debug, Default)]
 pub struct NetworkDiagnostics {
     pub total_positions: u64,
-    pub accum_stm: LayerDiagnostics,
-    pub accum_ntm: LayerDiagnostics,
     pub accum_combined: LayerDiagnostics,
     pub l1: LayerDiagnostics,
     pub l2: LayerDiagnostics,
 }
 
 impl NetworkDiagnostics {
-    pub fn new(h1_size: usize) -> Self {
+    pub fn new(accum_size: usize, l1_total: usize, l2_total: usize) -> Self {
         Self {
             total_positions: 0,
-            accum_stm: LayerDiagnostics::new(256),
-            accum_ntm: LayerDiagnostics::new(256),
-            accum_combined: LayerDiagnostics::new(256),
-            l1: LayerDiagnostics::new(h1_size),
-            l2: LayerDiagnostics::new(32),
+            accum_combined: LayerDiagnostics::new(accum_size),
+            l1: LayerDiagnostics::new(l1_total),
+            l2: LayerDiagnostics::new(l2_total),
         }
     }
 
     pub fn merge(&mut self, other: &Self) {
         self.total_positions += other.total_positions;
-        self.accum_stm.merge(&other.accum_stm);
-        self.accum_ntm.merge(&other.accum_ntm);
         self.accum_combined.merge(&other.accum_combined);
         self.l1.merge(&other.l1);
         self.l2.merge(&other.l2);
@@ -125,9 +109,13 @@ pub fn analyze_weights(
     positions_per_pack: usize,
 ) -> io::Result<NetworkDiagnostics> {
     let weights = NnueWeights::load_from_file(weights_path)?;
-    let h1_size = weights.hidden1_size;
+    let n = weights.accum_size;
+    let half = n / 2;
+    let h1_n = weights.hidden1_size;
+    let h2_n = weights.hidden2_size;
+    let b_n = weights.num_buckets;
 
-    let mut full_diag = NetworkDiagnostics::new(h1_size);
+    let mut full_diag = NetworkDiagnostics::new(n, b_n * h1_n, b_n * h2_n);
     let batch_size = 65_536;
 
     for (pack_idx, pack_path) in pack_paths.iter().enumerate() {
@@ -143,22 +131,23 @@ pub fn analyze_weights(
             let batch_diag = batch
                 .par_chunks(4096)
                 .map(|chunk| {
-                    let mut chunk_diag = NetworkDiagnostics::new(h1_size);
+                    let mut chunk_diag = NetworkDiagnostics::new(n, b_n * h1_n, b_n * h2_n);
                     chunk_diag.total_positions = chunk.len() as u64;
+
+                    let mut pairwise = vec![0.0f32; n];
+                    let mut h1 = vec![0.0f32; h1_n];
 
                     for board in chunk {
                         let mut stm_features = Vec::with_capacity(32);
                         let mut ntm_features = Vec::with_capacity(32);
-
                         crate::inputs::map_halfka_hm(board, |stm, ntm| {
                             stm_features.push(stm);
                             ntm_features.push(ntm);
                         });
 
-                        // 1. Accumulator forward pass
                         let mut stm_acc = weights.l0b.clone();
                         for &feat in &stm_features {
-                            let row = &weights.l0w[feat * 256..(feat + 1) * 256];
+                            let row = &weights.l0w[feat * n..(feat + 1) * n];
                             for (acc, &w) in stm_acc.iter_mut().zip(row) {
                                 *acc += w;
                             }
@@ -166,75 +155,57 @@ pub fn analyze_weights(
 
                         let mut ntm_acc = weights.l0b.clone();
                         for &feat in &ntm_features {
-                            let row = &weights.l0w[feat * 256..(feat + 1) * 256];
+                            let row = &weights.l0w[feat * n..(feat + 1) * n];
                             for (acc, &w) in ntm_acc.iter_mut().zip(row) {
                                 *acc += w;
                             }
                         }
 
-                        let mut combined = [0.0f32; 512];
-                        for i in 0..256 {
-                            let stm_pre = stm_acc[i];
-                            let ntm_pre = ntm_acc[i];
-
-                            let c_stm = stm_pre.clamp(0.0, 1.0);
-                            let stm_act = c_stm * c_stm;
-
-                            let c_ntm = ntm_pre.clamp(0.0, 1.0);
-                            let ntm_act = c_ntm * c_ntm;
-
-                            combined[i] = stm_act;
-                            combined[256 + i] = ntm_act;
-
-                            chunk_diag.accum_stm.neurons[i].record(stm_pre, stm_act);
-                            chunk_diag.accum_ntm.neurons[i].record(ntm_pre, ntm_act);
-
-                            let max_act = stm_act.max(ntm_act);
-                            let max_pre = stm_pre.max(ntm_pre);
-                            chunk_diag.accum_combined.neurons[i].record(max_pre, max_act);
+                        for i in 0..n {
+                            let s_act = stm_acc[i].clamp(0.0, 1.0);
+                            let n_act = ntm_acc[i].clamp(0.0, 1.0);
+                            chunk_diag.accum_combined.neurons[i].record(stm_acc[i].max(ntm_acc[i]), s_act.max(n_act));
                         }
 
-                        // 2. Hidden Layer 1 forward pass (256 pairwise -> h1_size)
-                        let mut h1 = vec![0.0f32; h1_size];
-                        let mut pairwise = [0.0f32; 256];
-                        for i in 0..128 {
-                            pairwise[i] = combined[i] * combined[128 + i];
-                            pairwise[128 + i] = combined[256 + i] * combined[384 + i];
+                        for i in 0..half {
+                            pairwise[i] = stm_acc[i].clamp(0.0, 1.0) * stm_acc[half + i].clamp(0.0, 1.0);
+                            pairwise[half + i] = ntm_acc[i].clamp(0.0, 1.0) * ntm_acc[half + i].clamp(0.0, 1.0);
                         }
-                        for (i, h) in h1.iter_mut().enumerate() {
-                            let row = &weights.l1w[i * 256..(i + 1) * 256];
-                            let mut dot = weights.l1b[i];
-                            for (c, &w) in pairwise.iter().zip(row) {
-                                dot += c * w;
+
+                        let occ = board.occ().count_ones() as usize;
+                        let bucket = ((occ.saturating_sub(2)) / 4).min(b_n - 1);
+
+                        let l1b_b = &weights.l1b[bucket * h1_n..(bucket + 1) * h1_n];
+                        let l1w_b = &weights.l1w[bucket * h1_n * n..(bucket + 1) * h1_n * n];
+                        for r in 0..h1_n {
+                            let row = &l1w_b[r * n..(r + 1) * n];
+                            let mut sum = l1b_b[r];
+                            for (&p, &w) in pairwise.iter().zip(row) {
+                                sum += p * w;
                             }
-
-                            let c = dot.clamp(0.0, 1.0);
+                            let c = sum.clamp(0.0, 1.0);
                             let act = c * c;
-
-                            *h = act;
-                            chunk_diag.l1.neurons[i].record(dot, act);
+                            h1[r] = act;
+                            chunk_diag.l1.neurons[bucket * h1_n + r].record(sum, act);
                         }
 
-                        // 3. Hidden Layer 2 forward pass (h1_size -> 32)
-                        let mut h2 = [0.0f32; 32];
-                        for (j, h) in h2.iter_mut().enumerate() {
-                            let row = &weights.l2w[j * h1_size..(j + 1) * h1_size];
-                            let mut dot = weights.l2b[j];
-                            for (val, &w) in h1.iter().zip(row) {
-                                dot += val * w;
+                        let l2b_b = &weights.l2b[bucket * h2_n..(bucket + 1) * h2_n];
+                        let l2w_b = &weights.l2w[bucket * h2_n * h1_n..(bucket + 1) * h2_n * h1_n];
+                        for r in 0..h2_n {
+                            let row = &l2w_b[r * h1_n..(r + 1) * h1_n];
+                            let mut sum = l2b_b[r];
+                            for (&v, &w) in h1.iter().zip(row) {
+                                sum += v * w;
                             }
-
-                            let c = dot.clamp(0.0, 1.0);
+                            let c = sum.clamp(0.0, 1.0);
                             let act = c * c;
-
-                            *h = act;
-                            chunk_diag.l2.neurons[j].record(dot, act);
+                            chunk_diag.l2.neurons[bucket * h2_n + r].record(sum, act);
                         }
                     }
 
                     chunk_diag
                 })
-                .reduce(|| NetworkDiagnostics::new(h1_size), |mut a, b| {
+                .reduce(|| NetworkDiagnostics::new(n, b_n * h1_n, b_n * h2_n), |mut a, b| {
                     a.merge(&b);
                     a
                 });

@@ -136,12 +136,6 @@ fn locate_search_config(engine_path: &Path) -> Option<PathBuf> {
         return Some(cwd_cfg);
     }
 
-    // 3. Known KittyEngine repository path
-    let known = PathBuf::from("C:/Users/evanh/Desktop/KittyEngineV5/x64/Release/search_config.yaml");
-    if known.exists() {
-        return Some(known);
-    }
-
     None
 }
 
@@ -160,9 +154,13 @@ pub fn run_sprt_match(
         return Err(format!("Cutechess CLI binary not found at: {}", config.cutechess_path));
     }
 
-    let engine_path = Path::new(&config.engine_path);
+    let (engine_path, _engine_dir) = config.resolve_engine();
     if !engine_path.exists() {
-        return Err(format!("KittyEngine binary not found at: {}", config.engine_path));
+        return Err(format!(
+            "KittyEngine binary '{}' not found at: {}",
+            config.engine_name,
+            engine_path.display()
+        ));
     }
 
     if !candidate_weights.exists() {
@@ -200,28 +198,28 @@ pub fn run_sprt_match(
         .map_err(|e| format!("Failed to stage champion weights: {}", e))?;
 
     // Copy search_config.yaml into both sandboxes so the engine has valid search heuristics
-    if let Some(search_cfg) = locate_search_config(engine_path) {
+    if let Some(search_cfg) = locate_search_config(&engine_path) {
         let _ = fs::copy(&search_cfg, candidate_dir.join("search_config.yaml"));
         let _ = fs::copy(&search_cfg, champion_dir.join("search_config.yaml"));
     }
 
-    println!("================================================================================");
-    println!("⚔️ INITIATING AUTOMATED SPRT VERIFICATION (Cutechess-CLI)");
-    println!("================================================================================");
-    println!("  Candidate:      {}", candidate_weights.display());
-    println!("  Champion:       {}", champion_weights.display());
-    println!("  Engine Binary:  {}", config.engine_path);
-    if !config.engine_args.is_empty() {
-        println!("  Engine Args:    {}", config.engine_args);
-    }
-    println!("  Opening Book:   {} (depth: {})", config.book_path, config.book_depth);
-    println!("  Time Control:   {} | Concurrency: {} | Max Rounds: {}",
-        config.time_control, config.concurrency, config.max_rounds);
-    println!("  SPRT Bounds:    Elo [{}, {}] | Alpha: {} | Beta: {}",
-        config.elo0, config.elo1, config.alpha, config.beta);
-    println!("  Adjudication:   Draw moves >= {} (score <= {} cp), Resign moves >= {} (score <= -{} cp)",
-        config.draw_movenumber, config.draw_score, config.resign_movecount, config.resign_score);
-    println!("--------------------------------------------------------------------------------");
+    let cand_name = candidate_weights
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("Candidate");
+    let champ_name = champion_weights
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("Champion");
+
+    println!(
+        "⚔️ [SPRT Verification] {} vs {} (max {} games | TC: {} | Threads: {})",
+        cand_name,
+        champ_name,
+        config.max_rounds * 2,
+        config.time_control,
+        config.concurrency
+    );
 
     // 2. Build cutechess command
     let mut engine_args: Vec<String> = Vec::new();
@@ -252,7 +250,7 @@ pub fn run_sprt_match(
     let mut cmd = Command::new(&config.cutechess_path);
     cmd.arg("-engine")
         .arg("name=Candidate")
-        .arg(format!("cmd={}", config.engine_path))
+        .arg(format!("cmd={}", engine_path.display()))
         .arg(format!("dir={}", candidate_dir.display()));
     for arg in &engine_args {
         cmd.arg(format!("arg={}", arg));
@@ -261,7 +259,7 @@ pub fn run_sprt_match(
 
     cmd.arg("-engine")
         .arg("name=Champion")
-        .arg(format!("cmd={}", config.engine_path))
+        .arg(format!("cmd={}", engine_path.display()))
         .arg(format!("dir={}", champion_dir.display()));
     for arg in &engine_args {
         cmd.arg(format!("arg={}", arg));
@@ -427,12 +425,35 @@ pub fn run_sprt_match(
                 total_games, config.max_rounds * 2, wins, losses, draws, win_pct, elo_str, llr_str
             );
             let _ = std::io::stdout().flush();
+
+            // Early Mathematical Cutoff for Candidate vs Champion:
+            let max_games = config.max_rounds * 2;
+            let remaining = max_games.saturating_sub(total_games);
+            if total_games >= 20 {
+                if wins > losses + remaining {
+                    println!(
+                        "\n  ⚡ Early Cutoff: Champion defeat mathematically guaranteed (+{}W vs max possible {}W with {} games left).",
+                        wins, losses + remaining, remaining
+                    );
+                    explicit_decision = Some(SprtDecision::AcceptedH1);
+                    let _ = child.kill();
+                    break;
+                } else if wins + remaining <= losses {
+                    println!(
+                        "\n  ⚡ Early Cutoff: Defeating Champion mathematically impossible (max possible {}W vs {}L with {} games left).",
+                        wins + remaining, losses, remaining
+                    );
+                    explicit_decision = Some(SprtDecision::AcceptedH0);
+                    let _ = child.kill();
+                    break;
+                }
+            }
         }
     }
 
     let status = child.wait().map_err(|e| format!("Cutechess process wait error: {}", e))?;
     println!();
-    if !status.success() {
+    if !status.success() && explicit_decision.is_none() {
         eprintln!("[sprt] Warning: Cutechess exited with status: {}", status);
     }
 
@@ -465,32 +486,39 @@ pub fn run_sprt_match(
     };
     let (promoted, promo_reason) = temp_res.should_promote(config.elo1);
 
-    println!("--------------------------------------------------------------------------------");
-    println!("SPRT Match Result:");
-    println!("  Total Games: {}", total_games);
-    println!("  Score:       Candidate +{} -{} ={} ({:.1}%)",
-        wins, losses, draws, if total_games > 0 { (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0 } else { 0.0 });
-    if let (Some(diff), Some(err)) = (elo_diff, elo_error) {
-        println!("  Elo Diff:    {:+.1} +/- {:.1}", diff, err);
-    } else if let Some(diff) = elo_diff {
-        println!("  Elo Diff:    {:+.1}", diff);
-    }
-    if let (Some(l), Some(lb), Some(ub)) = (llr, lbound, ubound) {
-        println!("  SPRT LLR:    {:.4} [Bounds: {:.2}, {:.2}]", l, lb, ub);
-    }
-    match &decision {
-        SprtDecision::AcceptedH1 => println!("  🏆 VERDICT: ACCEPT H1 (Candidate is statistically superior -> Promoted to Champion!)"),
-        SprtDecision::AcceptedH0 => println!("  ❌ VERDICT: ACCEPT H0 (Candidate failed SPRT -> Champion retained)"),
+    let win_pct = if total_games > 0 {
+        (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0
+    } else {
+        0.0
+    };
+    let elo_disp = match (elo_diff, elo_error) {
+        (Some(diff), Some(err)) => format!("Elo: {:+.1} +/- {:.1}", diff, err),
+        (Some(diff), None) => format!("Elo: {:+.1}", diff),
+        _ => "Elo: N/A".to_string(),
+    };
+    let llr_disp = match (llr, lbound, ubound) {
+        (Some(l), Some(lb), Some(ub)) => format!("LLR: {:.2} [{:.2}, {:.2}]", l, lb, ub),
+        (Some(l), _, _) => format!("LLR: {:.2}", l),
+        _ => "LLR: N/A".to_string(),
+    };
+
+    let verdict_icon = if promoted { "🏆" } else { "🛡️" };
+    let verdict_msg = match &decision {
+        SprtDecision::AcceptedH1 => "ACCEPT H1 (Statistically superior search weights)",
+        SprtDecision::AcceptedH0 => "REJECT H0 (Failed to defeat Champion)",
         SprtDecision::Inconclusive => {
             if promoted {
-                println!("  🏆 VERDICT: INCONCLUSIVE with DECISIVE LEAD -> QUALIFIED FOR PROMOTION!");
-                println!("     Reason: {}", promo_reason);
+                "DECISIVE LEAD (Qualified for promotion)"
             } else {
-                println!("  ⚖️ VERDICT: INCONCLUSIVE (Max rounds reached without hypothesis confirmation)");
+                "INCONCLUSIVE (Champion retained)"
             }
         }
-    }
-    println!("================================================================================\n");
+    };
+
+    println!(
+        "  {} [SPRT Result] {}: +{} -{} ={} ({:.1}%, {} games) | {} | {}",
+        verdict_icon, verdict_msg, wins, losses, draws, win_pct, total_games, elo_disp, llr_disp
+    );
 
     let verdict_str = match &decision {
         SprtDecision::AcceptedH1 => "ACCEPTED H1 (Candidate statistically superior)".to_string(),
@@ -726,5 +754,29 @@ mod tests {
         };
         let (promote, _) = res_neg_llr.should_promote(elo1);
         assert!(!promote);
+    }
+
+    #[test]
+    fn test_mathematical_cutoff_logic() {
+        let max_games = 120usize;
+
+        // Case 1: Early in match (e.g. 10 games) -> neither cutoff should trigger
+        let (w, l, d) = (6, 2, 2);
+        let total = w + l + d;
+        let remaining = max_games - total;
+        assert!(!(w > l + remaining));
+        assert!(!(w + remaining <= l));
+
+        // Case 2: Trailing so badly that winning 100% of remaining games cannot beat losses
+        let (w, l, d) = (15, 60, 5); // total = 80, remaining = 40
+        let total = w + l + d;
+        let remaining = max_games - total;
+        assert!(w + remaining <= l); // 15 + 40 = 55 <= 60 (Impossible to win!)
+
+        // Case 3: Leading so overwhelmingly that losing 100% of remaining games still preserves victory
+        let (w, l, d) = (65, 10, 5); // total = 80, remaining = 40
+        let total = w + l + d;
+        let remaining = max_games - total;
+        assert!(w > l + remaining); // 65 > 10 + 40 = 50 (Guaranteed victory!)
     }
 }

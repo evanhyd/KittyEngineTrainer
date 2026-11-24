@@ -22,10 +22,10 @@ use bullet_lib::{
     value::{loader, ValueTrainerBuilder},
 };
 
-use inputs::{KittyHalfKAHM, MajorMinorCount};
+use inputs::{KittyHalfKAHM, TotalPieceCount};
 use config::{
-    TrainerConfig, CHAMPION_FILE, DATA_DIR, SCRATCH_FILE,
-    INPUT_SIZE, ACCUM_SIZE, PAIRWISE_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS,
+    TrainerConfig, CHAMPION_FILE, DATA_DIR, ENGINE_WEIGHTS_FILE,
+    INPUT_SIZE, NUM_KING_BUCKETS, ACCUM_SIZE, PAIRWISE_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS, CHECKPOINT_SIZE,
 };
 
 const SCALE: f32 = 400.0;
@@ -33,7 +33,7 @@ const SCALE: f32 = 400.0;
 fn print_usage() {
     println!("KittyEngineTrainer - High-Performance NNUE Trainer via Bullet");
     println!("============================================================");
-    println!("Architecture: (24576 -> 256) x 2 -> 256 (pairwise) -> 64 -> 32 -> 1 x 8 (KittyEngine Layout)");
+    println!("Architecture: HalfKA-16 (12288 -> 768)x2 -> 768 (Pairwise CReLU) -> [16 -> 32 -> 1] x 8 (NNUESGD8)");
     println!();
     println!("CONFIGURATION:");
     println!("  Training & SPRT parameters are loaded from 'config.yaml'.");
@@ -61,15 +61,15 @@ fn print_usage() {
 }
 
 fn run_info() {
-    println!("KittyEngine NNUE Layout Specification:");
-    println!("  Input Feature Space:   {} (HalfKAv2 HM, 32 folded king squares x 768 piece planes)", INPUT_SIZE);
-    println!("  Dual Accumulator:      {} per perspective", ACCUM_SIZE);
-    println!("  Pairwise Interaction:  (128 + 128) -> {} (Hadamard product within STM/NTM)", PAIRWISE_SIZE);
-    println!("  Hidden Layer 1:        {} -> {} (Dense + Activation)", PAIRWISE_SIZE, HIDDEN1_SIZE);
-    println!("  Hidden Layer 2:        64 -> {} (Dense + Activation)", HIDDEN2_SIZE);
-    println!("  Output Layer:          32 -> 1 x {} Buckets (Major/Minor Piece Count)", NUM_OUTPUT_BUCKETS);
+    println!("KittyEngine NNUE v8 Layout Specification:");
+    println!("  Input Feature Space:   {} (HalfKAv2-16 HM, {} king buckets x 768 planes + l0f factoriser)", INPUT_SIZE, NUM_KING_BUCKETS);
+    println!("  Dual Accumulator:      {} per perspective (QA = 255)", ACCUM_SIZE);
+    println!("  Pairwise Interaction:  (384 + 384) -> {} (Pairwise CReLU within STM/NTM)", PAIRWISE_SIZE);
+    println!("  Hidden Layer 1:        {} -> {} x {} Buckets (SCReLU, int8 QB = 64)", PAIRWISE_SIZE, HIDDEN1_SIZE, NUM_OUTPUT_BUCKETS);
+    println!("  Hidden Layer 2:        {} -> {} x {} Buckets (SCReLU, int16 QB = 64)", HIDDEN1_SIZE, HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS);
+    println!("  Output Layer:          {} -> 1 x {} Buckets (Total Piece Count, logit QB = 64)", HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS);
     println!("  Centipawn Scale:       {:.1} cp", SCALE);
-    println!("  Target Weight Size:    25,242,088 bytes (NNUESGD6 format)");
+    println!("  Target Weight Size:    {} bytes (NNUESGD8 format)", CHECKPOINT_SIZE);
 }
 
 fn run_stop() {
@@ -80,8 +80,8 @@ fn run_stop() {
         Ok(()) => {
             println!("  Trigger file created: {}", signal::STOP_TRIGGER_FILE);
             println!("  The active training process will finish its current superbatch, cleanly");
-            println!("  export and verify weights to 'checkpoints/weights_step_<N>.bin' and");
-            println!("  'weights.bin', and exit safely without any data corruption.");
+            println!("  export and verify weights to 'checkpoints/weights_step_<N>.bin',");
+            println!("  and exit safely without any data corruption.");
             println!("================================================================================");
         }
         Err(e) => {
@@ -97,9 +97,9 @@ fn run_export(args: &[String]) {
     let (src_path, out_path) = if let Some(target) = target_step_or_path {
         if let Ok(step) = target.parse::<usize>() {
             let folder = PathBuf::from(format!("checkpoints/kitty_bullet_screlu-{}", step));
-            let raw = folder.join("raw.bin");
+            let quantised = folder.join("quantised.bin");
             let out = custom_out.unwrap_or_else(|| PathBuf::from(format!("weights_step_{}.bin", step)));
-            (raw, out)
+            (quantised, out)
         } else {
             let path = PathBuf::from(target);
             let out = custom_out.unwrap_or_else(|| PathBuf::from("weights.bin"));
@@ -111,9 +111,9 @@ fn run_export(args: &[String]) {
             let out = custom_out.unwrap_or_else(|| PathBuf::from("weights.bin"));
             (champ, out)
         } else if let Some((step, folder)) = config::detect_latest_checkpoint() {
-            let raw = folder.join("raw.bin");
+            let quantised = folder.join("quantised.bin");
             let out = custom_out.unwrap_or_else(|| PathBuf::from(format!("weights_step_{}.bin", step)));
-            (raw, out)
+            (quantised, out)
         } else {
             eprintln!("Error: No champion weights or checkpoint found in 'checkpoints/' to export.");
             return;
@@ -127,7 +127,8 @@ fn run_export(args: &[String]) {
 
     println!("Exporting weights from '{}' to '{}'...", src_path.display(), out_path.display());
 
-    if src_path.file_name().and_then(|s| s.to_str()) != Some("raw.bin") && src_path.extension().and_then(|s| s.to_str()) == Some("bin") {
+    let src_name = src_path.file_name().and_then(|s| s.to_str());
+    if src_name != Some("quantised.bin") && src_name != Some("raw.bin") && src_path.extension().and_then(|s| s.to_str()) == Some("bin") {
         match fs::copy(&src_path, &out_path) {
             Ok(_) => println!("Export completed successfully: {}", out_path.display()),
             Err(e) => eprintln!("Failed to copy weights: {}", e),
@@ -162,18 +163,8 @@ fn run_sprt(args: &[String]) {
         return;
     }
 
-    match sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path) {
-        Ok(res) => {
-            let (passed, reason) = res.should_promote(cfg.sprt.elo1);
-            if passed {
-                println!("Candidate verified superior to Champion under SPRT ({}).", reason);
-            } else {
-                println!("Candidate did not meet criteria to defeat Champion under SPRT.");
-            }
-        }
-        Err(e) => {
-            eprintln!("SPRT execution failed: {}", e);
-        }
+    if let Err(e) = sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path) {
+        eprintln!("SPRT execution failed: {}", e);
     }
 }
 
@@ -191,12 +182,13 @@ fn run_status() {
     println!("  - Learning Rate:       {:.6} (peak) -> {:.6} (min)", cfg.lr, cfg.min_lr);
     println!("  - Batch Size:          {} positions", cfg.batch_size);
     println!("  - Checkpoint Save:     Every {} superbatch(es) (permanent playtest export)", cfg.save_interval);
-    println!("  - Positive Biases:     L0={:.2}, L1={:.2}, L2={:.2}", cfg.bias_l0, cfg.bias_l1, cfg.bias_l2);
     println!();
     println!("⚔️ SPRT VERIFICATION SETTINGS:");
+    let (resolved_engine, _) = cfg.sprt.resolve_engine();
     println!("  - SPRT Enabled:        {}", cfg.sprt.enabled);
     println!("  - Cutechess CLI:       {}", cfg.sprt.cutechess_path);
-    println!("  - Engine Executable:   {}", cfg.sprt.engine_path);
+    println!("  - Engine Name:         {}", cfg.sprt.engine_name);
+    println!("  - Engine Executable:   {}", resolved_engine.display());
     if !cfg.sprt.engine_args.is_empty() {
         println!("  - Engine Arguments:    {}", cfg.sprt.engine_args);
     }
@@ -651,7 +643,7 @@ fn run_train(args: &[String]) {
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(KittyHalfKAHM)
-        .output_buckets(MajorMinorCount::<8>)
+        .output_buckets(TotalPieceCount::<NUM_OUTPUT_BUCKETS>)
         .save_format(&[
             SavedFormat::id("l0w"),
             SavedFormat::id("l0b"),
@@ -665,22 +657,20 @@ fn run_train(args: &[String]) {
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0 = builder.new_affine("l0", INPUT_SIZE, ACCUM_SIZE);
-            let l1 = builder.new_affine("l1", PAIRWISE_SIZE, HIDDEN1_SIZE);
-            let l2 = builder.new_affine("l2", HIDDEN1_SIZE, HIDDEN2_SIZE);
+            l0.init_with_effective_input_size(32);
+
+            let l1 = builder.new_affine("l1", PAIRWISE_SIZE, NUM_OUTPUT_BUCKETS * HIDDEN1_SIZE);
+            let l2 = builder.new_affine("l2", HIDDEN1_SIZE, NUM_OUTPUT_BUCKETS * HIDDEN2_SIZE);
             let l3 = builder.new_affine("l3", HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS);
 
-            // Vectorized pairwise interaction (Hadamard product) between halves of each perspective
-            let stm_act = l0.forward(stm_inputs).screlu();
-            let stm_hidden = stm_act.slice_rows(0, ACCUM_SIZE / 2) * stm_act.slice_rows(ACCUM_SIZE / 2, ACCUM_SIZE);
+            let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
+            let stm_hidden = ft(stm_inputs, 0, ACCUM_SIZE / 2) * ft(stm_inputs, ACCUM_SIZE / 2, ACCUM_SIZE);
+            let ntm_hidden = ft(ntm_inputs, 0, ACCUM_SIZE / 2) * ft(ntm_inputs, ACCUM_SIZE / 2, ACCUM_SIZE);
 
-            let ntm_act = l0.forward(ntm_inputs).screlu();
-            let ntm_hidden = ntm_act.slice_rows(0, ACCUM_SIZE / 2) * ntm_act.slice_rows(ACCUM_SIZE / 2, ACCUM_SIZE);
-
-            let pairwise = stm_hidden.concat(ntm_hidden);
-
-            let h1 = l1.forward(pairwise).screlu();
-            let h2 = l2.forward(h1).screlu();
-            l3.forward(h2).select(output_buckets)
+            let hl1 = stm_hidden.concat(ntm_hidden);
+            let hl2 = l1.forward(hl1).select(output_buckets).screlu();
+            let hl3 = l2.forward(hl2).select(output_buckets).screlu();
+            l3.forward(hl3).select(output_buckets)
         });
 
     if let Some(ref w_path) = weights_path {
@@ -703,24 +693,6 @@ fn run_train(args: &[String]) {
                 eprintln!("Failed to load weights into trainer: {:?}", e);
                 return;
             }
-        }
-    } else {
-        let scratch_kitty_path = Path::new(SCRATCH_FILE);
-        let init_bullet_path = Path::new("checkpoints/init_bullet_weights.bin");
-
-        if let Err(e) = export::generate_scratch_kitty_weights(scratch_kitty_path, cfg.bias_l0, cfg.bias_l1, cfg.bias_l2) {
-            eprintln!("Failed to generate scratch weights: {}", e);
-            return;
-        }
-
-        if let Err(e) = export::import_from_kitty_weights(scratch_kitty_path, init_bullet_path) {
-            eprintln!("Failed to import scratch weights into Bullet format: {}", e);
-            return;
-        }
-
-        if let Err(e) = trainer.optimiser.load_weights_from_file(init_bullet_path.to_str().unwrap()) {
-            eprintln!("Failed to load scratch weights into trainer: {:?}", e);
-            return;
         }
     }
 
@@ -754,7 +726,12 @@ fn run_train(args: &[String]) {
                 baseline_smse = v.get("smse").and_then(|x| x.as_f64()).unwrap_or(f64::MAX);
             }
 
-    let pack_strs: Vec<String> = train_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let mut ordered_train_files = train_files.clone();
+    if start_superbatch > 1 && ordered_train_files.len() > 1 {
+        let rot = ((start_superbatch - 1) * ordered_train_files.len() / superbatches.max(1)) % ordered_train_files.len();
+        ordered_train_files.rotate_left(rot);
+    }
+    let pack_strs: Vec<String> = ordered_train_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
     let pack_refs: Vec<&str> = pack_strs.iter().map(|s| s.as_str()).collect();
 
     let direct_loader = if !is_sfbinpack {
@@ -764,11 +741,13 @@ fn run_train(args: &[String]) {
     };
 
     let sf_loader = if is_sfbinpack {
-        Some(loader::sfbinpack::SfBinpackLoader::new_concat_multiple(
-            &pack_refs,
-            512,
-            8,
-            |entry| !entry.pos.is_checked(entry.pos.side_to_move()) && entry.score.abs() <= 10000,
+        Some(convert::PersistentDataReader::new(
+            loader::sfbinpack::SfBinpackLoader::new_concat_multiple(
+                &pack_refs,
+                512,
+                8,
+                |entry| !entry.pos.is_checked(entry.pos.side_to_move()) && entry.score.abs() <= 10000,
+            ),
         ))
     } else {
         None
@@ -784,15 +763,14 @@ fn run_train(args: &[String]) {
     let total_eval_pos = eval_positions_per_pack * train_files.len();
 
     println!("================================================================================");
-    println!("KittyEngineTrainer | Architecture: HalfKA (24576->256)x2 -> 256 -> 64 -> 32 -> 1x8");
+    println!("KittyEngineTrainer | Architecture: HalfKA-16 (12288->768)x2 -> 768 (Pairwise CReLU) -> [16->32->1]x8");
     println!("  Dataset:    {} files ({})", train_files.len(), total_pos_str);
     println!("  Schedule:   Steps {}..{} | {} batches/sb ({:.1}M pos/sb) | Batch: {}",
         start_superbatch, superbatches, batches_per_superbatch, positions_per_superbatch as f64 / 1_000_000.0, batch_size);
     println!("  Learning:   LR: {:.6} -> {:.6} (Cosine) | WDL: {:.2} | Save: Every {} sb ({:.1}M pos)",
         max_lr, min_lr, wdl_val, save_interval, (save_interval * positions_per_superbatch) as f64 / 1_000_000.0);
-    println!("  Validation: {} pos/pack ({:.2}M total) | Biases: L0={:.2}, L1={:.2}, L2={:.2}",
-        eval_positions_per_pack, total_eval_pos as f64 / 1_000_000.0,
-        cfg.bias_l0, cfg.bias_l1, cfg.bias_l2);
+    println!("  Validation: {} pos/pack ({:.2}M total) | Factoriser: l0f (16 king buckets)",
+        eval_positions_per_pack, total_eval_pos as f64 / 1_000_000.0);
     if cfg.sprt.enabled {
         println!("  SPRT Gate:  Enabled | TC: {} | Concurrency: {} | Max Rounds: {} | Elo [{:.1}, {:.1}]",
             cfg.sprt.time_control, cfg.sprt.concurrency, cfg.sprt.max_rounds, cfg.sprt.elo0, cfg.sprt.elo1);
@@ -817,12 +795,8 @@ fn run_train(args: &[String]) {
             return;
         }
 
-        let next_flush = if current_step % save_interval == 0 {
-            current_step
-        } else {
-            ((current_step / save_interval) + 1) * save_interval
-        };
-        let chunk_end = next_flush.min(superbatches);
+        // Run 1 superbatch at a time so stop requests take effect immediately after the active superbatch
+        let is_interval_step = (current_step % save_interval == 0) || (current_step == superbatches);
 
         let schedule = TrainingSchedule {
             net_id: net_id.clone(),
@@ -831,7 +805,7 @@ fn run_train(args: &[String]) {
                 batch_size,
                 batches_per_superbatch,
                 start_superbatch: current_step,
-                end_superbatch: chunk_end,
+                end_superbatch: current_step,
             },
             wdl_scheduler: wdl::ConstantWDL { value: wdl_val },
             lr_scheduler: lr::CosineDecayLR {
@@ -839,7 +813,7 @@ fn run_train(args: &[String]) {
                 final_lr: min_lr,
                 final_superbatch: superbatches,
             },
-            save_rate: save_interval,
+            save_rate: 1, // save raw checkpoint at the end of each superbatch
         };
 
         if let Some(ref l) = sf_loader {
@@ -849,33 +823,30 @@ fn run_train(args: &[String]) {
         }
 
         let stop_requested = signal::is_stop_requested();
-        if stop_requested {
-            println!("\n🛑 [STOP SIGNAL DETECTED] Completing step {} weight export cleanly...", chunk_end);
-        }
+        let checkpoint_dir = format!("checkpoints/{net_id}-{current_step}");
+        let quantised_path = format!("{checkpoint_dir}/quantised.bin");
+        let exported_bin = format!("checkpoints/weights_screlu_step{current_step}.bin");
+        let periodic_bin = format!("checkpoints/weights_step_{current_step}.bin");
 
-        let checkpoint_dir = format!("checkpoints/{net_id}-{chunk_end}");
-        let raw_path = format!("{checkpoint_dir}/raw.bin");
-        let exported_bin = format!("checkpoints/weights_screlu_step{chunk_end}.bin");
-        let periodic_bin = format!("checkpoints/weights_step_{chunk_end}.bin");
-
-        if Path::new(&raw_path).exists() {
-            if let Err(e) = export::export_from_raw_checkpoint(Path::new(&raw_path), Path::new(&periodic_bin)) {
-                eprintln!("Failed to export weights for step {}: {}", chunk_end, e);
-                if stop_requested {
-                    signal::clear_stop_files();
-                    return;
+        if stop_requested || is_interval_step {
+            if Path::new(&quantised_path).exists() {
+                if let Err(e) = export::export_from_raw_checkpoint(Path::new(&quantised_path), Path::new(&periodic_bin)) {
+                    eprintln!("Failed to export weights for step {}: {}", current_step, e);
+                    if stop_requested {
+                        signal::clear_stop_files();
+                        return;
+                    }
+                    current_step += 1;
+                    continue;
                 }
-                current_step = chunk_end + 1;
-                continue;
+                let _ = fs::copy(&periodic_bin, &exported_bin);
+                println!("💾 [Step {}/{}] Checkpoint exported -> {}", current_step, superbatches, periodic_bin);
             }
-            let _ = fs::copy(&periodic_bin, &exported_bin);
-            let _ = fs::copy(&periodic_bin, "weights.bin");
-            println!("💾 [Step {}/{}] Checkpoint exported -> {}", chunk_end, superbatches, periodic_bin);
 
             if stop_requested {
                 println!("\n================================================================================");
-                println!("🛑 SAFE MANUAL STOP COMPLETE: Stopped cleanly at step {}/{}", chunk_end, superbatches);
-                println!("  Exported weights: {} | Active: weights.bin", periodic_bin);
+                println!("🛑 SAFE MANUAL STOP COMPLETE: Stopped cleanly right after superbatch {}/{}", current_step, superbatches);
+                println!("  Exported weights: {}", periodic_bin);
                 println!("  To resume: cargo run --release -- train");
                 println!("================================================================================");
                 signal::clear_stop_files();
@@ -897,7 +868,7 @@ fn run_train(args: &[String]) {
 
                     println!(
                         "📊 [Eval Step {}/{}] Overall MAE: {:.6}{} | SMSE: {:.6}{} | Mate MAE: {:.6} ({:.1}M pos)",
-                        chunk_end, superbatches,
+                        current_step, superbatches,
                         overall.mae(), diff_mae_str,
                         overall.smse(), diff_smse_str,
                         mate.mae(),
@@ -905,46 +876,49 @@ fn run_train(args: &[String]) {
                     );
 
                     // SPRT Promotion Policy: SPRT is the EXCLUSIVE gate for champion promotion
+                    let sync_champion_weights = |src: &str| {
+                        let _ = fs::copy(src, CHAMPION_FILE);
+                        let engine_weights = Path::new(ENGINE_WEIGHTS_FILE);
+                        if let Some(parent) = engine_weights.parent() {
+                            let _ = fs::create_dir_all(parent);
+                        }
+                        if let Err(e) = fs::copy(src, engine_weights) {
+                            eprintln!("⚠️ Failed to sync champion weights to {}: {}", ENGINE_WEIGHTS_FILE, e);
+                        } else {
+                            println!("  📦 Synced champion weights -> {}", ENGINE_WEIGHTS_FILE);
+                        }
+                    };
                     let champion_file = Path::new(CHAMPION_FILE);
                     let (promoted, sprt_stats) = if !champion_file.exists() {
-                        println!("👑 [Baseline Established] Step {} registered as active champion.", chunk_end);
-                        let _ = fs::copy(&exported_bin, CHAMPION_FILE);
+                        println!("👑 [Baseline Established] Step {} registered as active champion.", current_step);
+                        sync_champion_weights(&exported_bin);
                         baseline_mae = overall.mae();
                         baseline_smse = overall.smse();
                         let base_entry = format!(
                             "[{}] BASELINE CHAMPION ESTABLISHED\n  Step:    {}\n  Weights: {}\n  MAE:     {:.6} | SMSE: {:.6}\n  --------------------------------------------------------------------------------",
-                            sprt::current_timestamp(), chunk_end, CHAMPION_FILE, baseline_mae, baseline_smse
+                            sprt::current_timestamp(), current_step, CHAMPION_FILE, baseline_mae, baseline_smse
                         );
                         sprt::append_to_match_log(&base_entry);
-                        prune_outdated_checkpoints(chunk_end);
+                        prune_outdated_checkpoints(current_step);
                         (true, None)
                     } else if cfg.sprt.enabled {
-                        println!("⚔️ [SPRT Step {}] Running match vs active champion...", chunk_end);
                         match sprt::run_sprt_match(&cfg.sprt, Path::new(&exported_bin), champion_file) {
                             Ok(res) => {
                                 let (passed, reason) = res.should_promote(cfg.sprt.elo1);
                                 if passed {
-                                    println!("🏆 [SPRT] Champion Promoted! ({}) +{} -{} ={} (Elo {:+.1} +/- {:.1}, LLR: {:.4})",
-                                        reason,
-                                        res.wins, res.losses, res.draws,
-                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0),
-                                        res.llr.unwrap_or(0.0));
-                                    let _ = fs::copy(&exported_bin, CHAMPION_FILE);
+                                    println!("  👑 [Promotion] Step {} crowned as new Champion! Outdated checkpoints cleaned.", current_step);
+                                    sync_champion_weights(&exported_bin);
                                     baseline_mae = overall.mae();
                                     baseline_smse = overall.smse();
                                     let promo_entry = format!(
                                         "[{}] 👑 CHAMPION PROMOTED\n  Step:     {}\n  Reason:   {}\n  Score:    +{} -{} ={} | Elo: {:+.1} +/- {:.1} | LLR: {:.4}\n  Promoted: {}\n  --------------------------------------------------------------------------------",
-                                        sprt::current_timestamp(), chunk_end, reason, res.wins, res.losses, res.draws,
+                                        sprt::current_timestamp(), current_step, reason, res.wins, res.losses, res.draws,
                                         res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0),
                                         res.llr.unwrap_or(0.0),
                                         CHAMPION_FILE
                                     );
                                     sprt::append_to_match_log(&promo_entry);
-                                    prune_outdated_checkpoints(chunk_end);
-                                } else {
-                                    println!("🛡️ [SPRT] Champion Retained: +{} -{} ={} (Elo {:+.1} +/- {:.1})",
-                                        res.wins, res.losses, res.draws,
-                                        res.elo_diff.unwrap_or(0.0), res.elo_error.unwrap_or(0.0));
+                                    prune_outdated_checkpoints(current_step);
                                 }
                                 (passed, Some(res))
                             }
@@ -957,12 +931,12 @@ fn run_train(args: &[String]) {
                         (false, None)
                     };
 
-                    let global_batch_end = chunk_end * batches_per_superbatch;
+                    let global_batch_end = current_step * batches_per_superbatch;
                     let epoch = global_batch_end / total_dataset_batches + 1;
                     if promoted {
                         let mut rec = serde_json::json!({
-                            "step": chunk_end,
-                            "pack": format!("unified_epoch_{}_step_{}", epoch, chunk_end),
+                            "step": current_step,
+                            "pack": format!("unified_epoch_{}_step_{}", epoch, current_step),
                             "epoch": epoch,
                             "wdl": wdl_val,
                             "mae": overall.mae(),
@@ -999,7 +973,7 @@ fn run_train(args: &[String]) {
                     }
 
                     record_training_history(
-                        chunk_end,
+                        current_step,
                         epoch,
                         global_batch_end * batch_size,
                         wdl_val,
@@ -1013,12 +987,17 @@ fn run_train(args: &[String]) {
                     );
                 }
                 Err(e) => {
-                    eprintln!("Evaluation failed for step {}: {}", chunk_end, e);
+                    eprintln!("Evaluation failed for step {}: {}", current_step, e);
                 }
+            }
+        } else {
+            // Intermediate superbatch: clean up temporary raw checkpoint folder so disk space is not wasted
+            if Path::new(&checkpoint_dir).exists() {
+                let _ = fs::remove_dir_all(&checkpoint_dir);
             }
         }
 
-        current_step = chunk_end + 1;
+        current_step += 1;
     }
 
     signal::clear_stop_files();
@@ -1142,7 +1121,7 @@ fn run_eval(args: &[String]) {
     println!("  Weights File:        {}", weights_path.display());
     println!("  Positions per pack:  {}", positions_per_pack);
     println!("  Total Est Positions: {}", pack_paths.len() * positions_per_pack);
-    println!("  Activation:          SCReLU (NNUESGD6)");
+    println!("  Activation:          Pairwise CReLU + SCReLU head (NNUESGD8)");
     println!("  WDL lambda:          {:.2}", wdl_val);
 
     let start = std::time::Instant::now();
@@ -1309,7 +1288,7 @@ fn run_dead_neurons(args: &[String]) {
     println!("NNUE Dead Neuron & Network Activity Analysis");
     println!("================================================================================");
     println!("  Weights File:          {}", weights_path.display());
-    println!("  Activation:            SCReLU (clamp(x, 0, 1)^2)");
+    println!("  Activation:            Pairwise CReLU (clamp(lo,0,1) * clamp(hi,0,1))");
     println!("  Packs Analyzed:        {}", pack_paths.len());
     println!("  Positions per pack:    {}", positions_per_pack);
     println!("  Total Sample Target:   {} positions", pack_paths.len() * positions_per_pack);
@@ -1331,33 +1310,28 @@ fn run_dead_neurons(args: &[String]) {
         diag.total_positions
     );
 
-    // 1. Accumulator (L0: 256 neurons)
+    let n = weights.accum_size;
+    let half = n / 2;
+    let h1_n = weights.hidden1_size;
+    let h2_n = weights.hidden2_size;
+    let num_buckets = weights.num_buckets;
+
     let mut accum_dead = Vec::new();
     let mut accum_low = Vec::new();
     let mut accum_rates = Vec::new();
 
-    let h1_size = weights.hidden1_size;
-    let h2_size = weights.hidden2_size;
-    let num_buckets = weights.num_buckets;
-    let l1_in_size = weights.l1_input_size;
-
-    for i in 0..256 {
+    for i in 0..n {
         let comb = &diag.accum_combined.neurons[i];
         let rate = comb.firing_rate();
         accum_rates.push(rate);
 
+        let p = i % half;
         let mut out_norm_sq = 0.0f32;
-        if weights.is_pairwise {
-            let p = i % 128;
-            for h in 0..h1_size {
-                let w_stm = weights.l1w[h * 256 + p];
-                let w_ntm = weights.l1w[h * 256 + 128 + p];
-                out_norm_sq += w_stm * w_stm + w_ntm * w_ntm;
-            }
-        } else {
-            for h in 0..h1_size {
-                let w_stm = weights.l1w[h * 512 + i];
-                let w_ntm = weights.l1w[h * 512 + 256 + i];
+        for b in 0..num_buckets {
+            for r in 0..h1_n {
+                let row_base = (b * h1_n + r) * n;
+                let w_stm = weights.l1w[row_base + p];
+                let w_ntm = weights.l1w[row_base + half + p];
                 out_norm_sq += w_stm * w_stm + w_ntm * w_ntm;
             }
         }
@@ -1371,125 +1345,58 @@ fn run_dead_neurons(args: &[String]) {
     }
 
     accum_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let accum_avg_rate: f64 = accum_rates.iter().sum::<f64>() / 256.0;
-    let accum_median_rate = accum_rates[128];
+    let accum_avg_rate: f64 = accum_rates.iter().sum::<f64>() / n as f64;
+    let accum_median_rate = accum_rates[n / 2];
     let accum_min_rate = accum_rates[0];
-    let accum_max_rate = accum_rates[255];
+    let accum_max_rate = accum_rates[n - 1];
 
-    // 2. Hidden Layer 1
-    let mut l1_dead = Vec::new();
-    let mut l1_low = Vec::new();
-    let mut l1_rates = Vec::new();
-    let mut l1_details = Vec::new();
-
-    for i in 0..h1_size {
-        let n = &diag.l1.neurons[i];
-        let rate = n.firing_rate();
-        l1_rates.push(rate);
-
-        let in_norm: f32 = weights.l1w[i * l1_in_size..(i + 1) * l1_in_size].iter().map(|w| w * w).sum::<f32>().sqrt();
-        let out_norm: f32 = (0..h2_size).map(|j| {
-            let w = weights.l2w[j * h1_size + i];
-            w * w
-        }).sum::<f32>().sqrt();
-
-        let is_dead = n.fires == 0 || in_norm < 1e-7 || out_norm < 1e-7;
-        if is_dead {
-            l1_dead.push(i);
-            l1_details.push((i, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l1b[i], in_norm, out_norm, true));
-        } else if rate < 1.0 {
-            l1_low.push(i);
-            l1_details.push((i, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l1b[i], in_norm, out_norm, false));
-        } else if verbose {
-            l1_details.push((i, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l1b[i], in_norm, out_norm, false));
-        }
-    }
+    let l1_total = num_buckets * h1_n;
+    let l1_dead = diag.l1.neurons.iter().filter(|x| x.fires == 0).count();
+    let mut l1_rates: Vec<f64> = diag.l1.neurons.iter().map(|x| x.firing_rate()).collect();
     l1_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let l1_min_rate = l1_rates[0];
-    let l1_med_rate = l1_rates[h1_size / 2];
-    let l1_avg_rate: f64 = l1_rates.iter().sum::<f64>() / h1_size as f64;
-    let l1_max_rate = l1_rates[h1_size - 1];
 
-    // 3. Hidden Layer 2
-    let mut l2_dead = Vec::new();
-    let mut l2_low = Vec::new();
-    let mut l2_rates = Vec::new();
-    let mut l2_details = Vec::new();
-
-    for j in 0..h2_size {
-        let n = &diag.l2.neurons[j];
-        let rate = n.firing_rate();
-        l2_rates.push(rate);
-
-        let in_norm: f32 = weights.l2w[j * h1_size..(j + 1) * h1_size].iter().map(|w| w * w).sum::<f32>().sqrt();
-        let out_norm: f32 = (0..num_buckets).map(|b| {
-            let w = weights.l3w[b * h2_size + j];
-            w * w
-        }).sum::<f32>().sqrt();
-
-        let is_dead = n.fires == 0 || in_norm < 1e-7 || out_norm < 1e-7;
-        if is_dead {
-            l2_dead.push(j);
-            l2_details.push((j, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l2b[j], in_norm, out_norm, true));
-        } else if rate < 1.0 {
-            l2_low.push(j);
-            l2_details.push((j, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l2b[j], in_norm, out_norm, false));
-        } else if verbose {
-            l2_details.push((j, rate, n.mean_activation(), n.min_pre, n.max_pre, weights.l2b[j], in_norm, out_norm, false));
-        }
-    }
+    let l2_total = num_buckets * h2_n;
+    let l2_dead = diag.l2.neurons.iter().filter(|x| x.fires == 0).count();
+    let mut l2_rates: Vec<f64> = diag.l2.neurons.iter().map(|x| x.firing_rate()).collect();
     l2_rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let l2_min_rate = l2_rates[0];
-    let l2_med_rate = l2_rates[h2_size / 2];
-    let l2_avg_rate: f64 = l2_rates.iter().sum::<f64>() / h2_size as f64;
-    let l2_max_rate = l2_rates[h2_size - 1];
-
-    let l1_label = format!("Layer 1 (Dense {}->{})", l1_in_size, h1_size);
-    let l2_label = format!("Layer 2 (Dense {}->{})", h1_size, h2_size);
 
     println!("--------------------------------------------------------------------------------");
     println!("{:<24} | {:>7} | {:>10} | {:>6} | {:<32}",
         "Layer", "Neurons", "Active", "Dead", "Firing Rates (Min / Med / Mean / Max)");
     println!("{:-<24}-+-{:-<7}-+-{:-<10}-+-{:-<6}-+-{:-<32}", "", "", "", "", "");
     println!("{:<24} | {:>7} | {:>9.1}% | {:>6} | {:>5.1}% / {:>5.1}% / {:>5.1}% / {:>5.1}%",
-        "Layer 0 (Accumulator)", 256, (256 - accum_dead.len()) as f64 / 256.0 * 100.0, accum_dead.len(),
+        "Layer 0 (Accumulator)", n, (n - accum_dead.len()) as f64 / n as f64 * 100.0, accum_dead.len(),
         accum_min_rate, accum_median_rate, accum_avg_rate, accum_max_rate);
     println!("{:<24} | {:>7} | {:>9.1}% | {:>6} | {:>5.1}% / {:>5.1}% / {:>5.1}% / {:>5.1}%",
-        l1_label, h1_size, (h1_size - l1_dead.len()) as f64 / h1_size as f64 * 100.0, l1_dead.len(),
-        l1_min_rate, l1_med_rate, l1_avg_rate, l1_max_rate);
+        "Layer 1 (16 x 8)", l1_total, (l1_total - l1_dead) as f64 / l1_total as f64 * 100.0, l1_dead,
+        l1_rates[0], l1_rates[l1_total / 2], l1_rates.iter().sum::<f64>() / l1_total as f64, l1_rates[l1_total - 1]);
     println!("{:<24} | {:>7} | {:>9.1}% | {:>6} | {:>5.1}% / {:>5.1}% / {:>5.1}% / {:>5.1}%",
-        l2_label, h2_size, (h2_size - l2_dead.len()) as f64 / h2_size as f64 * 100.0, l2_dead.len(),
-        l2_min_rate, l2_med_rate, l2_avg_rate, l2_max_rate);
+        "Layer 2 (32 x 8)", l2_total, (l2_total - l2_dead) as f64 / l2_total as f64 * 100.0, l2_dead,
+        l2_rates[0], l2_rates[l2_total / 2], l2_rates.iter().sum::<f64>() / l2_total as f64, l2_rates[l2_total - 1]);
     println!("--------------------------------------------------------------------------------");
 
-    let total_dead = accum_dead.len() + l1_dead.len() + l2_dead.len();
-    if total_dead > 0 || !accum_low.is_empty() || !l1_low.is_empty() || !l2_low.is_empty() || verbose {
+    if !accum_dead.is_empty() || !accum_low.is_empty() || verbose {
         let label = if verbose { "Neuron Details" } else { "Problematic / Inactive Neurons" };
         println!("\n⚠️ {label}:");
-        println!("{:<8} | {:<10} | {:>11} | {:>10} | {:<24} | {:>8} | {:>8} | {:>8} | Status",
-            "Neuron", "Layer", "Firing Rate", "Mean Act", "Pre-Act [Min, Max]", "Bias", "In-Norm", "Out-Norm");
-        println!("{:-<8}-+-{:-<10}-+-{:-<11}-+-{:-<10}-+-{:-<24}-+-{:-<8}-+-{:-<8}-+-{:-<8}-+-------", "", "", "", "", "", "", "", "");
+        println!("{:<8} | {:<10} | {:>11} | {:>10} | {:<24} | {:>8} | {:>8} | Status",
+            "Neuron", "Layer", "Firing Rate", "Mean Act", "Pre-Act [Min, Max]", "Bias", "Out-Norm");
+        println!("{:-<8}-+-{:-<10}-+-{:-<11}-+-{:-<10}-+-{:-<24}-+-{:-<8}-+-{:-<8}-+-------", "", "", "", "", "", "", "");
         for &(i, rate, mean_a, min_p, max_p, bias, out_n) in &accum_dead {
-            println!("{:<8} | {:<10} | {:>10.2}% | {:>10.6} | [{:>10.4}, {:>10.4}] | {:>8.4} | {:>8} | {:>8.4} | ❌ DEAD",
-                format!("#{i}"), "Layer 0", rate, mean_a, min_p, max_p, bias, "-", out_n);
+            println!("{:<8} | {:<10} | {:>10.2}% | {:>10.6} | [{:>10.4}, {:>10.4}] | {:>8.4} | {:>8.4} | ❌ DEAD",
+                format!("#{i}"), "Layer 0", rate, mean_a, min_p, max_p, bias, out_n);
         }
-        for &(i, rate, mean_a, min_p, max_p, bias, in_n, out_n, is_dead) in &l1_details {
-            println!("{:<8} | {:<10} | {:>10.2}% | {:>10.6} | [{:>10.4}, {:>10.4}] | {:>8.4} | {:>8.4} | {:>8.4} | {}",
-                format!("#{i}"), "Layer 1", rate, mean_a, min_p, max_p, bias, in_n, out_n, if is_dead { "❌ DEAD" } else { "⚠️ LOW" });
+        for &(i, rate, mean_a, min_p, max_p, bias, out_n) in &accum_low {
+            println!("{:<8} | {:<10} | {:>10.2}% | {:>10.6} | [{:>10.4}, {:>10.4}] | {:>8.4} | {:>8.4} | ⚠️ LOW",
+                format!("#{i}"), "Layer 0", rate, mean_a, min_p, max_p, bias, out_n);
         }
-        for &(j, rate, mean_a, min_p, max_p, bias, in_n, out_n, is_dead) in &l2_details {
-            println!("{:<8} | {:<10} | {:>10.2}% | {:>10.6} | [{:>10.4}, {:>10.4}] | {:>8.4} | {:>8.4} | {:>8.4} | {}",
-                format!("#{j}"), "Layer 2", rate, mean_a, min_p, max_p, bias, in_n, out_n, if is_dead { "❌ DEAD" } else { "⚠️ LOW" });
-        }
-    } else {
-        println!("✅ All {} neurons across all layers are active and healthy!", 256 + HIDDEN1_SIZE + HIDDEN2_SIZE);
     }
 
-    let total_neurons = 256 + HIDDEN1_SIZE + HIDDEN2_SIZE;
+    let total_neurons = n + l1_total + l2_total;
+    let total_dead = accum_dead.len() + l1_dead + l2_dead;
     let total_active = total_neurons - total_dead;
     println!("\nVerdict: {}/{} neurons active ({:.1}% network utilization).{}",
         total_active, total_neurons, total_active as f64 / total_neurons as f64 * 100.0,
-        if total_dead == 0 { " (All layers healthy)" } else { " (Dead neurons listed above)" }
+        if total_dead == 0 { " (All layers healthy)" } else { " (Dead neurons detected)" }
     );
     println!("================================================================================\n");
 }
@@ -1505,7 +1412,7 @@ fn run_compare(args: &[String]) {
         .dual_perspective()
         .optimiser(AdamW)
         .inputs(KittyHalfKAHM)
-        .output_buckets(MajorMinorCount::<8>)
+        .output_buckets(TotalPieceCount::<NUM_OUTPUT_BUCKETS>)
         .save_format(&[
             SavedFormat::id("l0w"),
             SavedFormat::id("l0b"),
@@ -1519,29 +1426,36 @@ fn run_compare(args: &[String]) {
         .loss_fn(|output, target| output.sigmoid().squared_error(target))
         .build(|builder, stm_inputs, ntm_inputs, output_buckets| {
             let l0 = builder.new_affine("l0", INPUT_SIZE, ACCUM_SIZE);
-            let l1 = builder.new_affine("l1", PAIRWISE_SIZE, HIDDEN1_SIZE);
-            let l2 = builder.new_affine("l2", HIDDEN1_SIZE, HIDDEN2_SIZE);
+            l0.init_with_effective_input_size(32);
+
+            let l1 = builder.new_affine("l1", PAIRWISE_SIZE, NUM_OUTPUT_BUCKETS * HIDDEN1_SIZE);
+            let l2 = builder.new_affine("l2", HIDDEN1_SIZE, NUM_OUTPUT_BUCKETS * HIDDEN2_SIZE);
             let l3 = builder.new_affine("l3", HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS);
 
-            // Vectorized pairwise interaction (Hadamard product) between halves of each perspective
-            let stm_act = l0.forward(stm_inputs).screlu();
-            let stm_hidden = stm_act.slice_rows(0, ACCUM_SIZE / 2) * stm_act.slice_rows(ACCUM_SIZE / 2, ACCUM_SIZE);
+            let ft = |input, start, end| l0.slice(start, end).forward(input).crelu();
+            let stm_hidden = ft(stm_inputs, 0, ACCUM_SIZE / 2) * ft(stm_inputs, ACCUM_SIZE / 2, ACCUM_SIZE);
+            let ntm_hidden = ft(ntm_inputs, 0, ACCUM_SIZE / 2) * ft(ntm_inputs, ACCUM_SIZE / 2, ACCUM_SIZE);
 
-            let ntm_act = l0.forward(ntm_inputs).screlu();
-            let ntm_hidden = ntm_act.slice_rows(0, ACCUM_SIZE / 2) * ntm_act.slice_rows(ACCUM_SIZE / 2, ACCUM_SIZE);
-
-            let pairwise = stm_hidden.concat(ntm_hidden);
-
-            let h1 = l1.forward(pairwise).screlu();
-            let h2 = l2.forward(h1).screlu();
-            l3.forward(h2).select(output_buckets)
+            let hl1 = stm_hidden.concat(ntm_hidden);
+            let hl2 = l1.forward(hl1).select(output_buckets).screlu();
+            let hl3 = l2.forward(hl2).select(output_buckets).screlu();
+            l3.forward(hl3).select(output_buckets)
         });
 
     trainer.load_from_checkpoint(checkpoint_dir);
     println!("Successfully loaded Bullet checkpoint into GPU!");
 
-    let exported_path = Path::new(CHAMPION_FILE);
-    let cpu_weights = eval::NnueWeights::load_from_file(exported_path).expect("Failed to load exported weights");
+    let compare_bin = Path::new("checkpoints/compare_tmp.bin");
+    let quantised_path = Path::new(checkpoint_dir).join("quantised.bin");
+    let cpu_weights = if quantised_path.exists() {
+        export::export_from_raw_checkpoint(&quantised_path, compare_bin)
+            .expect("Failed to export quantised.bin for comparison");
+        let w = eval::NnueWeights::load_from_file(compare_bin).expect("Failed to load exported weights");
+        let _ = fs::remove_file(compare_bin);
+        w
+    } else {
+        eval::NnueWeights::load_from_file(Path::new(CHAMPION_FILE)).expect("Failed to load exported weights")
+    };
 
     let test_fens = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -1578,13 +1492,6 @@ fn main() {
         "check" => run_check(&args),
         "eval" => run_eval(&args),
         "export" => run_export(&args),
-        "scratch" => {
-            let cfg = TrainerConfig::load_or_default();
-            let default_out = PathBuf::from(SCRATCH_FILE);
-            let out = args.get(2).map(PathBuf::from).unwrap_or(default_out);
-            export::generate_scratch_kitty_weights(&out, cfg.bias_l0, cfg.bias_l1, cfg.bias_l2).expect("Failed to generate scratch weights");
-            println!("Scratch weights generated successfully at {}", out.display());
-        }
         "compare" => run_compare(&args),
         "info" => run_info(),
         "dead-neurons" | "dead" => run_dead_neurons(&args),

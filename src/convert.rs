@@ -1,6 +1,8 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::{Arc, Mutex, mpsc};
+use bullet_trainer::reader::DataReader;
 use bulletformat::ChessBoard;
 use sfbinpack::{
     TrainingDataEntry,
@@ -118,5 +120,75 @@ pub fn for_each_board_in_pack<F: FnMut(&[ChessBoard]) -> bool>(
         });
 
         Ok(total_read)
+    }
+}
+
+/// Wraps any `DataReader<T>` (such as `SfBinpackLoader`, which ignores `skip_count` and
+/// reopens from byte 0 on every `read_chunks` call) in a single persistent background stream.
+/// Each superbatch resumes at the exact next chunk across all binpack files instead of
+/// restarting at byte 0 of `pack1.binpack`.
+pub struct PersistentDataReader<T: Send + 'static> {
+    rx: Arc<Mutex<mpsc::Receiver<Vec<T>>>>,
+}
+
+impl<T: Send + 'static> Clone for PersistentDataReader<T> {
+    fn clone(&self) -> Self {
+        Self { rx: Arc::clone(&self.rx) }
+    }
+}
+
+impl<T: Clone + Send + 'static> PersistentDataReader<T> {
+    pub fn new<R: DataReader<T>>(inner: R) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Vec<T>>(1);
+        std::thread::spawn(move || {
+            inner.read_chunks(0, |chunk| tx.send(chunk.to_vec()).is_err());
+        });
+        Self { rx: Arc::new(Mutex::new(rx)) }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> DataReader<T> for PersistentDataReader<T> {
+    fn read_chunks<F: FnMut(&[T]) -> bool>(&self, _skip_count: usize, mut f: F) {
+        let rx = self.rx.lock().expect("PersistentDataReader mutex poisoned");
+        while let Ok(chunk) = rx.recv() {
+            if f(&chunk) {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct SeqReader(usize);
+
+    impl DataReader<u32> for SeqReader {
+        fn read_chunks<F: FnMut(&[u32]) -> bool>(&self, _skip: usize, mut f: F) {
+            for i in 0..self.0 as u32 {
+                if f(&[i]) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_persistent_data_reader_advances_across_superbatches() {
+        let reader = PersistentDataReader::new(SeqReader(10));
+        let mut seen = Vec::new();
+
+        for _ in 0..3 {
+            let mut count = 0;
+            reader.read_chunks(0, |chunk| {
+                seen.extend_from_slice(chunk);
+                count += 1;
+                count >= 2
+            });
+        }
+
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
     }
 }

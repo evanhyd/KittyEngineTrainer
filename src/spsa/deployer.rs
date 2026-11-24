@@ -6,39 +6,29 @@ use super::params::{
 };
 
 pub struct Deployer {
-    pub desktop_config_path: PathBuf,
-    pub local_config_path: Option<PathBuf>,
+    pub engine_config_path: PathBuf,
     pub history_dir: PathBuf,
     pub deploy_log_path: PathBuf,
 }
 
 impl Deployer {
-    pub fn new<P: AsRef<Path>, Q: AsRef<Path>, R: AsRef<Path>>(
-        desktop_config_path: P,
-        local_config_path: Option<Q>,
+    pub fn new<P: AsRef<Path>, R: AsRef<Path>>(
+        engine_config_path: P,
         history_dir: R,
     ) -> Self {
         let h_dir = history_dir.as_ref().to_path_buf();
         let log_path = h_dir.join("deploy_log.txt");
         Self {
-            desktop_config_path: desktop_config_path.as_ref().to_path_buf(),
-            local_config_path: local_config_path.map(|p| p.as_ref().to_path_buf()),
+            engine_config_path: engine_config_path.as_ref().to_path_buf(),
             history_dir: h_dir,
             deploy_log_path: log_path,
         }
     }
 
     pub fn get_deployed_config(&self) -> HashMap<String, f64> {
-        if self.desktop_config_path.exists() {
-            if let Ok(map) = load_config_yaml(&self.desktop_config_path) {
+        if self.engine_config_path.exists() {
+            if let Ok(map) = load_config_yaml(&self.engine_config_path) {
                 return map;
-            }
-        }
-        if let Some(local) = &self.local_config_path {
-            if local.exists() {
-                if let Ok(map) = load_config_yaml(local) {
-                    return map;
-                }
             }
         }
         HashMap::new()
@@ -82,25 +72,25 @@ impl Deployer {
 
         let old_cfg = self.get_deployed_config();
 
-        // 1. Backup existing desktop config if present
-        if self.desktop_config_path.exists() {
+        // 1. Backup existing engine config if present
+        if self.engine_config_path.exists() {
             let backup_name = format!("search_config_backup_{}.yaml", now);
             let backup_path = self.history_dir.join(backup_name);
-            let _ = fs::copy(&self.desktop_config_path, &backup_path);
+            let _ = fs::copy(&self.engine_config_path, &backup_path);
             println!("  [Deployer] Backed up old config: {}", backup_path.display());
         }
 
-        // 2. Write new config to desktop & local engine folder
-        write_search_config(new_theta, &self.desktop_config_path)?;
-        if let Some(local) = &self.local_config_path {
-            let _ = write_search_config(new_theta, local);
+        // 2. Write new config to engine directory only
+        if let Some(parent) = self.engine_config_path.parent() {
+            let _ = fs::create_dir_all(parent);
         }
+        write_search_config(new_theta, &self.engine_config_path)?;
 
         let diffs = self.get_parameter_diff(&old_cfg, new_theta);
 
         println!("================================================================================");
         println!("🚀 DEPLOYED NEW SEARCH CONFIGURATION (Iteration {})", iteration);
-        println!("  Target: {}", self.desktop_config_path.display());
+        println!("  Target: {}", self.engine_config_path.display());
         println!("  Reason: {}", reason);
         if let Some(s) = stats_str {
             println!("  Stats:  {}", s);
