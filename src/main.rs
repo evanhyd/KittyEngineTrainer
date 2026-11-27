@@ -8,25 +8,120 @@ mod sprt;
 mod signal;
 mod spsa;
 
+use std::cell::RefCell;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use bullet_lib::{
+    game::{inputs::SparseInputType, outputs::OutputBuckets},
     nn::optimiser::{AdamW, AdamWParams},
     trainer::{
         save::SavedFormat,
-        schedule::{lr, wdl, TrainingSchedule, TrainingSteps},
+        schedule::{lr::{self, LrScheduler}, TrainingSteps},
         settings::LocalSettings,
     },
-    value::{loader, ValueTrainerBuilder},
+    value::{loader::{self, LoadableDataType}, save as bullet_save, ValueTrainerBuilder},
 };
+use bullet_trainer::{
+    model::{ModelInputs, ModelInputsMapper},
+    optimiser::{Optimiser, OptimiserState},
+    reader::{DataReader, ReadMapLoader},
+    run::{self as bullet_run, TrainingEvent},
+};
+use bullet_lib::nn::ExecutionContext;
+use bulletformat::ChessBoard;
 
 use inputs::{KittyHalfKAHM, TotalPieceCount};
 use config::{
     TrainerConfig, CHAMPION_FILE, DATA_DIR, ENGINE_WEIGHTS_FILE,
     INPUT_SIZE, NUM_KING_BUCKETS, ACCUM_SIZE, PAIRWISE_SIZE, HIDDEN1_SIZE, HIDDEN2_SIZE, NUM_OUTPUT_BUCKETS, CHECKPOINT_SIZE,
 };
+
+#[allow(clippy::too_many_arguments)]
+fn run_quiet_superbatch<D, Opt>(
+    optimiser: &mut Optimiser<ExecutionContext, Opt>,
+    reader_loader: ReadMapLoader<D, ChessBoard>,
+    steps: TrainingSteps,
+    lr_sched: lr::CosineDecayLR,
+    superbatches: usize,
+    next_verify_step: usize,
+    is_interval_step: bool,
+    output_dir: &str,
+    net_id: &str,
+    saved_format: &[SavedFormat],
+) where
+    D: DataReader<ChessBoard>,
+    Opt: OptimiserState<ExecutionContext>,
+{
+    let batch_size = steps.batch_size;
+    let batches_per_superbatch = steps.batches_per_superbatch;
+    let error_record = RefCell::new(Vec::new());
+    let mut loss_sum = 0.0f32;
+    let mut ticks = 0.0f32;
+    let mut smooth_loss = 0.0f32;
+    let mut smooth_count = 0u32;
+
+    bullet_run::train_with_observer(
+        optimiser,
+        bullet_run::TrainingSchedule {
+            steps,
+            log_rate: 128,
+            lr_schedule: lr_sched.boxed(),
+        },
+        reader_loader,
+        |_, step, error| {
+            loss_sum += error;
+            ticks += 1.0;
+            if step.batch().is_multiple_of(32) || step.batch() + 1 == step.batches_per_superbatch() {
+                error_record.borrow_mut().push((step.superbatch(), step.batch(), loss_sum / ticks));
+                loss_sum = 0.0;
+                ticks = 0.0;
+            }
+        },
+        |opt, step| {
+            if is_interval_step || signal::is_stop_requested() {
+                let sb = step.superbatch();
+                let path = format!("{output_dir}/{net_id}-{sb}");
+                let _ = fs::create_dir_all(&path);
+                bullet_save::save_to_checkpoint(opt, saved_format, &path);
+                bullet_save::write_losses(&format!("{path}/log.txt"), &error_record.borrow());
+            }
+        },
+        &mut |event| match event {
+            TrainingEvent::BatchCompleted { step, loss, learning_rate, superbatch_elapsed, .. } => {
+                smooth_loss += *loss;
+                smooth_count += 1;
+                let completed = step.batch() + 1;
+                let total_b = step.batches_per_superbatch();
+                if step.batch().is_multiple_of(128) || completed == total_b {
+                    let avg_loss = smooth_loss / smooth_count as f32;
+                    let pct = completed as f32 / total_b as f32 * 100.0;
+                    let secs = superbatch_elapsed.as_secs_f32();
+                    let pos_s = if secs > 0.0 { (completed * batch_size) as f32 / secs } else { 0.0 };
+                    print!(
+                        "\r  [Train] SB {:>3}/{} (verify@{}) | {:>4}/{} ({:>5.1}%) | Loss: {:.5} | {:>6.0}k pos/s | LR: {:.6}   ",
+                        step.superbatch(), superbatches, next_verify_step,
+                        completed, total_b, pct, avg_loss, pos_s / 1000.0, learning_rate
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            TrainingEvent::SuperbatchCompleted { step, loss, superbatch_elapsed, .. } => {
+                let secs = superbatch_elapsed.as_secs_f32();
+                let pos_s = if secs > 0.0 { (batches_per_superbatch * batch_size) as f32 / secs } else { 0.0 };
+                print!(
+                    "\r  [Train] SB {:>3}/{} (verify@{}) | done ({:.1}s) | Loss: {:.5} | {:>6.0}k pos/s                 ",
+                    step.superbatch(), superbatches, next_verify_step, secs, loss, pos_s / 1000.0
+                );
+                let _ = std::io::stdout().flush();
+            }
+            _ => {}
+        },
+    )
+    .unwrap();
+}
 
 const SCALE: f32 = 400.0;
 
@@ -163,7 +258,7 @@ fn run_sprt(args: &[String]) {
         return;
     }
 
-    if let Err(e) = sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path) {
+    if let Err(e) = sprt::run_sprt_match(&cfg.sprt, &cand_path, &champ_path, None) {
         eprintln!("SPRT execution failed: {}", e);
     }
 }
@@ -716,14 +811,12 @@ fn run_train(args: &[String]) {
 
     let baseline_path = Path::new("checkpoints/baseline.json");
     let mut baseline_mae = f64::MAX;
-    let mut baseline_smse = f64::MAX;
 
     if !start_fresh
         && baseline_path.exists()
         && let Ok(content) = fs::read_to_string(baseline_path)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                 baseline_mae = v.get("mae").and_then(|x| x.as_f64()).unwrap_or(f64::MAX);
-                baseline_smse = v.get("smse").and_then(|x| x.as_f64()).unwrap_or(f64::MAX);
             }
 
     let mut ordered_train_files = train_files.clone();
@@ -755,71 +848,130 @@ fn run_train(args: &[String]) {
 
     let total_pos_str = if is_sfbinpack {
         let total_bytes: u64 = train_files.iter().map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0)).sum();
-        format!("~{:.1}B (Stockfish BINP)", total_bytes as f64 / 2.62 / 1_000_000_000.0)
+        format!("~{:.1}B", total_bytes as f64 / 2.62 / 1_000_000_000.0)
     } else {
-        format!("{:.1}M (ChessBoard)", total_positions as f64 / 1_000_000.0)
+        format!("{:.1}M", total_positions as f64 / 1_000_000.0)
     };
 
-    let total_eval_pos = eval_positions_per_pack * train_files.len();
+    let saved_format = vec![
+        SavedFormat::id("l0w"),
+        SavedFormat::id("l0b"),
+        SavedFormat::id("l1w"),
+        SavedFormat::id("l1b"),
+        SavedFormat::id("l2w"),
+        SavedFormat::id("l2b"),
+        SavedFormat::id("l3w"),
+        SavedFormat::id("l3b"),
+    ];
 
     println!("================================================================================");
-    println!("KittyEngineTrainer | Architecture: HalfKA-16 (12288->768)x2 -> 768 (Pairwise CReLU) -> [16->32->1]x8");
-    println!("  Dataset:    {} files ({})", train_files.len(), total_pos_str);
-    println!("  Schedule:   Steps {}..{} | {} batches/sb ({:.1}M pos/sb) | Batch: {}",
-        start_superbatch, superbatches, batches_per_superbatch, positions_per_superbatch as f64 / 1_000_000.0, batch_size);
-    println!("  Learning:   LR: {:.6} -> {:.6} (Cosine) | WDL: {:.2} | Save: Every {} sb ({:.1}M pos)",
-        max_lr, min_lr, wdl_val, save_interval, (save_interval * positions_per_superbatch) as f64 / 1_000_000.0);
-    println!("  Validation: {} pos/pack ({:.2}M total) | Factoriser: l0f (16 king buckets)",
-        eval_positions_per_pack, total_eval_pos as f64 / 1_000_000.0);
+    println!("KittyEngineTrainer | HalfKA-16 (12288->768)x2 -> 768 -> [16->32->1]x8");
+    println!("  Data:  {} files ({}) | Batch {} | {} b/sb ({:.1}M pos/sb)",
+        train_files.len(), total_pos_str, batch_size, batches_per_superbatch, positions_per_superbatch as f64 / 1_000_000.0);
+    println!("  Train: SB {}..{} | LR {:.6}->{:.6} | WDL {:.2} | Verify every {} sb",
+        start_superbatch, superbatches, max_lr, min_lr, wdl_val, save_interval);
     if cfg.sprt.enabled {
-        println!("  SPRT Gate:  Enabled | TC: {} | Concurrency: {} | Max Rounds: {} | Elo [{:.1}, {:.1}]",
-            cfg.sprt.time_control, cfg.sprt.concurrency, cfg.sprt.max_rounds, cfg.sprt.elo0, cfg.sprt.elo1);
+        println!("  SPRT:  TC {} | {}t | max {}g | Elo [{:.1}, {:.1}] | Engine: {}",
+            cfg.sprt.time_control, cfg.sprt.concurrency, cfg.sprt.max_rounds * 2,
+            cfg.sprt.elo0, cfg.sprt.elo1, cfg.sprt.engine_name);
     } else {
-        println!("  SPRT Gate:  Disabled");
+        println!("  SPRT:  Disabled");
     }
-    println!("  State:      {}", run_state_desc);
-    println!("  Controls:   Ctrl+C or type 'stop' + Enter to stop cleanly");
-    println!("================================================================================\n");
+    println!("  State: {} (Ctrl+C or 'stop' + Enter to stop)", run_state_desc);
+    println!("================================================================================");
 
     // Initialize graceful signal handler and interactive console listener
     signal::clear_stop_files();
     signal::init();
 
+    let make_mapper = || {
+        let inp = KittyHalfKAHM;
+        let out = TotalPieceCount::<NUM_OUTPUT_BUCKETS>;
+        let nnz = inp.max_active();
+        let num = inp.num_inputs();
+        let rscale = 1.0 / SCALE;
+
+        let inputs = ModelInputs::default()
+            .add_sparse("stm", (num, 1), nnz)
+            .add_sparse("nstm", (num, 1), nnz)
+            .add_sparse("buckets", (1, 1), 1)
+            .add_dense("targets", (1, 1))
+            .add_dense("entry_weights", (1, 1));
+
+        ModelInputsMapper::build(&inputs, move |pos: &ChessBoard, _step, ((((stm, ntm), buckets), targets), weights)| {
+            let mut cnt = 0;
+            inp.map_features(pos, |our, opp| {
+                stm[cnt] = our as i32;
+                ntm[cnt] = opp as i32;
+                cnt += 1;
+            });
+            if cnt < nnz {
+                stm[cnt] = -1;
+                ntm[cnt] = -1;
+            }
+            buckets[0] = i32::from(out.bucket(pos));
+            weights[0] = 1.0;
+
+            let score = 1.0 / (1.0 + (-(rscale * f32::from(pos.score()))).exp());
+            let result = f32::from(pos.result() as u8) / 2.0;
+            targets[0] = wdl_val * result + (1.0 - wdl_val) * score;
+        })
+    };
+
+    let _ = fs::create_dir_all(settings.output_directory);
     let mut current_step = start_superbatch;
 
     while current_step <= superbatches {
         if signal::is_stop_requested() {
-            println!("\n🛑 [STOP SIGNAL DETECTED] Safe stop before starting superbatch {}.", current_step);
-            println!("   Checkpoints preserved. Exiting cleanly.");
+            println!("\n🛑 Stop signal detected before SB {}. Exiting cleanly.", current_step);
             signal::clear_stop_files();
             return;
         }
 
         // Run 1 superbatch at a time so stop requests take effect immediately after the active superbatch
         let is_interval_step = (current_step % save_interval == 0) || (current_step == superbatches);
+        let next_verify_step = ((((current_step - 1) / save_interval) + 1) * save_interval).min(superbatches);
 
-        let schedule = TrainingSchedule {
-            net_id: net_id.clone(),
-            eval_scale: SCALE,
-            steps: TrainingSteps {
-                batch_size,
-                batches_per_superbatch,
-                start_superbatch: current_step,
-                end_superbatch: current_step,
-            },
-            wdl_scheduler: wdl::ConstantWDL { value: wdl_val },
-            lr_scheduler: lr::CosineDecayLR {
-                initial_lr: max_lr,
-                final_lr: min_lr,
-                final_superbatch: superbatches,
-            },
-            save_rate: 1, // save raw checkpoint at the end of each superbatch
+        let steps = TrainingSteps {
+            batch_size,
+            batches_per_superbatch,
+            start_superbatch: current_step,
+            end_superbatch: current_step,
+        };
+        let lr_sched = lr::CosineDecayLR {
+            initial_lr: max_lr,
+            final_lr: min_lr,
+            final_superbatch: superbatches,
         };
 
         if let Some(ref l) = sf_loader {
-            trainer.run(&schedule, &settings, l);
+            let loader = ReadMapLoader::new(l.clone(), make_mapper(), settings.threads as u8);
+            run_quiet_superbatch(
+                &mut trainer.optimiser,
+                loader,
+                steps,
+                lr_sched,
+                superbatches,
+                next_verify_step,
+                is_interval_step,
+                settings.output_directory,
+                &net_id,
+                &saved_format,
+            );
         } else if let Some(ref l) = direct_loader {
-            trainer.run(&schedule, &settings, l);
+            let loader = ReadMapLoader::new(l.clone(), make_mapper(), settings.threads as u8);
+            run_quiet_superbatch(
+                &mut trainer.optimiser,
+                loader,
+                steps,
+                lr_sched,
+                superbatches,
+                next_verify_step,
+                is_interval_step,
+                settings.output_directory,
+                &net_id,
+                &saved_format,
+            );
         }
 
         let stop_requested = signal::is_stop_requested();
@@ -831,7 +983,7 @@ fn run_train(args: &[String]) {
         if stop_requested || is_interval_step {
             if Path::new(&quantised_path).exists() {
                 if let Err(e) = export::export_from_raw_checkpoint(Path::new(&quantised_path), Path::new(&periodic_bin)) {
-                    eprintln!("Failed to export weights for step {}: {}", current_step, e);
+                    eprintln!("\nFailed to export weights for step {}: {}", current_step, e);
                     if stop_requested {
                         signal::clear_stop_files();
                         return;
@@ -840,15 +992,10 @@ fn run_train(args: &[String]) {
                     continue;
                 }
                 let _ = fs::copy(&periodic_bin, &exported_bin);
-                println!("💾 [Step {}/{}] Checkpoint exported -> {}", current_step, superbatches, periodic_bin);
             }
 
             if stop_requested {
-                println!("\n================================================================================");
-                println!("🛑 SAFE MANUAL STOP COMPLETE: Stopped cleanly right after superbatch {}/{}", current_step, superbatches);
-                println!("  Exported weights: {}", periodic_bin);
-                println!("  To resume: cargo run --release -- train");
-                println!("================================================================================");
+                println!("\n🛑 Stopped after SB {}/{} | Saved: {}", current_step, superbatches, periodic_bin);
                 signal::clear_stop_files();
                 return;
             }
@@ -856,23 +1003,13 @@ fn run_train(args: &[String]) {
             match eval::evaluate_checkpoint_packs(Path::new(&exported_bin), &data_files, eval_positions_per_pack, wdl_val) {
                 Ok((overall, non_mate, mate)) => {
                     let diff_mae_str = if baseline_mae < f64::MAX {
-                        format!(" ({:+.6} vs champ)", overall.mae() - baseline_mae)
+                        format!(" ({:+.6})", overall.mae() - baseline_mae)
                     } else {
                         String::new()
                     };
-                    let diff_smse_str = if baseline_smse < f64::MAX {
-                        format!(" ({:+.6} vs champ)", overall.smse() - baseline_smse)
-                    } else {
-                        String::new()
-                    };
-
-                    println!(
-                        "📊 [Eval Step {}/{}] Overall MAE: {:.6}{} | SMSE: {:.6}{} | Mate MAE: {:.6} ({:.1}M pos)",
-                        current_step, superbatches,
-                        overall.mae(), diff_mae_str,
-                        overall.smse(), diff_smse_str,
-                        mate.mae(),
-                        overall.count as f64 / 1_000_000.0
+                    let step_prefix = format!(
+                        "[Step {}/{}] MAE {:.6}{} SMSE {:.6}",
+                        current_step, superbatches, overall.mae(), diff_mae_str, overall.smse()
                     );
 
                     // SPRT Promotion Policy: SPRT is the EXCLUSIVE gate for champion promotion
@@ -884,32 +1021,27 @@ fn run_train(args: &[String]) {
                         }
                         if let Err(e) = fs::copy(src, engine_weights) {
                             eprintln!("⚠️ Failed to sync champion weights to {}: {}", ENGINE_WEIGHTS_FILE, e);
-                        } else {
-                            println!("  📦 Synced champion weights -> {}", ENGINE_WEIGHTS_FILE);
                         }
                     };
                     let champion_file = Path::new(CHAMPION_FILE);
                     let (promoted, sprt_stats) = if !champion_file.exists() {
-                        println!("👑 [Baseline Established] Step {} registered as active champion.", current_step);
                         sync_champion_weights(&exported_bin);
+                        println!("\r{} | 👑 BASELINE{}", step_prefix, " ".repeat(30));
                         baseline_mae = overall.mae();
-                        baseline_smse = overall.smse();
                         let base_entry = format!(
                             "[{}] BASELINE CHAMPION ESTABLISHED\n  Step:    {}\n  Weights: {}\n  MAE:     {:.6} | SMSE: {:.6}\n  --------------------------------------------------------------------------------",
-                            sprt::current_timestamp(), current_step, CHAMPION_FILE, baseline_mae, baseline_smse
+                            sprt::current_timestamp(), current_step, CHAMPION_FILE, baseline_mae, overall.smse()
                         );
                         sprt::append_to_match_log(&base_entry);
                         prune_outdated_checkpoints(current_step);
                         (true, None)
                     } else if cfg.sprt.enabled {
-                        match sprt::run_sprt_match(&cfg.sprt, Path::new(&exported_bin), champion_file) {
+                        match sprt::run_sprt_match(&cfg.sprt, Path::new(&exported_bin), champion_file, Some(&step_prefix)) {
                             Ok(res) => {
                                 let (passed, reason) = res.should_promote(cfg.sprt.elo1);
                                 if passed {
-                                    println!("  👑 [Promotion] Step {} crowned as new Champion! Outdated checkpoints cleaned.", current_step);
                                     sync_champion_weights(&exported_bin);
                                     baseline_mae = overall.mae();
-                                    baseline_smse = overall.smse();
                                     let promo_entry = format!(
                                         "[{}] 👑 CHAMPION PROMOTED\n  Step:     {}\n  Reason:   {}\n  Score:    +{} -{} ={} | Elo: {:+.1} +/- {:.1} | LLR: {:.4}\n  Promoted: {}\n  --------------------------------------------------------------------------------",
                                         sprt::current_timestamp(), current_step, reason, res.wins, res.losses, res.draws,
@@ -923,11 +1055,12 @@ fn run_train(args: &[String]) {
                                 (passed, Some(res))
                             }
                             Err(e) => {
-                                eprintln!("SPRT execution failed: {}", e);
+                                eprintln!("\nSPRT execution failed: {}", e);
                                 (false, None)
                             }
                         }
                     } else {
+                        println!("\r{} | SPRT disabled{}", step_prefix, " ".repeat(30));
                         (false, None)
                     };
 

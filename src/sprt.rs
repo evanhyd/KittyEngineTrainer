@@ -120,20 +120,66 @@ impl Drop for SandboxGuard {
     }
 }
 
-/// Discovers `search_config.yaml` near the engine binary or in known project paths.
+/// Minimum score fraction in (0, 1) required to achieve `elo` Elo difference.
+pub fn required_score_fraction(elo: f64) -> f64 {
+    1.0 / (1.0 + 10.0_f64.powf(-elo / 400.0))
+}
+
+/// Evaluates whether an SPRT match is already mathematically decided against
+/// the H1 hypothesis (`elo1`) given `wins`, `losses`, `draws`, and `max_games`.
+///
+/// - Returns `Some(SprtDecision::AcceptedH1)` only if the worst case (losing all
+///   remaining games) still achieves at least `elo1` Elo.
+/// - Returns `Some(SprtDecision::AcceptedH0)` if the best case (winning all
+///   remaining games) still cannot reach `elo1` Elo.
+/// - Returns `None` otherwise (including when `total < 20` or `remaining == 0`).
+pub fn check_sprt_early_cutoff(
+    wins: usize,
+    losses: usize,
+    draws: usize,
+    max_games: usize,
+    elo1: f64,
+) -> Option<SprtDecision> {
+    let total = wins + losses + draws;
+    let remaining = max_games.saturating_sub(total);
+    if total < 20 || remaining == 0 {
+        return None;
+    }
+
+    let current_score = wins as f64 + 0.5 * draws as f64;
+    let required_score = required_score_fraction(elo1) * max_games as f64;
+    let max_possible_score = current_score + remaining as f64;
+
+    if current_score >= required_score {
+        Some(SprtDecision::AcceptedH1)
+    } else if max_possible_score < required_score {
+        Some(SprtDecision::AcceptedH0)
+    } else {
+        None
+    }
+}
+
+/// Estimates Elo difference from W/L/D score when Cutechess has not emitted one yet.
+fn estimate_elo_from_score(wins: usize, losses: usize, draws: usize) -> Option<f64> {
+    let total = wins + losses + draws;
+    if total == 0 {
+        return None;
+    }
+    let score = (wins as f64 + 0.5 * draws as f64) / total as f64;
+    if score > 0.0 && score < 1.0 {
+        Some(-400.0 * ((1.0 / score) - 1.0).log10())
+    } else {
+        None
+    }
+}
+
+/// Discovers `search_config.yaml` inside the engine directory.
 fn locate_search_config(engine_path: &Path) -> Option<PathBuf> {
-    // 1. Same directory as engine executable
     if let Some(parent) = engine_path.parent() {
         let p = parent.join("search_config.yaml");
         if p.exists() {
             return Some(p);
         }
-    }
-
-    // 2. Current working directory
-    let cwd_cfg = PathBuf::from("search_config.yaml");
-    if cwd_cfg.exists() {
-        return Some(cwd_cfg);
     }
 
     None
@@ -144,6 +190,7 @@ pub fn run_sprt_match(
     config: &SprtConfig,
     candidate_weights: &Path,
     champion_weights: &Path,
+    line_prefix: Option<&str>,
 ) -> Result<SprtMatchResult, String> {
     if !config.enabled {
         return Err("SPRT verification is disabled in config.yaml".to_string());
@@ -212,14 +259,17 @@ pub fn run_sprt_match(
         .and_then(|f| f.to_str())
         .unwrap_or("Champion");
 
-    println!(
-        "⚔️ [SPRT Verification] {} vs {} (max {} games | TC: {} | Threads: {})",
-        cand_name,
-        champ_name,
-        config.max_rounds * 2,
-        config.time_control,
-        config.concurrency
-    );
+    let owned_prefix;
+    let label = match line_prefix {
+        Some(p) => p,
+        None => {
+            owned_prefix = format!("[SPRT {} vs {}]", cand_name, champ_name);
+            &owned_prefix
+        }
+    };
+
+    print!("\r{} | ⚔️   0/{} ...{: <35}", label, config.max_rounds * 2, "");
+    let _ = std::io::stdout().flush();
 
     // 2. Build cutechess command
     let mut engine_args: Vec<String> = Vec::new();
@@ -277,6 +327,8 @@ pub fn run_sprt_match(
         .arg("-repeat")
         .arg("-concurrency")
         .arg(config.concurrency.to_string())
+        .arg("-ratinginterval")
+        .arg("1")
         .arg("-draw")
         .arg(format!("movenumber={}", config.draw_movenumber))
         .arg(format!("movecount={}", config.draw_movecount))
@@ -316,6 +368,7 @@ pub fn run_sprt_match(
     let mut lbound = None;
     let mut ubound = None;
     let mut explicit_decision = None;
+    let mut early_cutoff = false;
 
     for line_res in reader.lines() {
         let line = match line_res {
@@ -355,14 +408,20 @@ pub fn run_sprt_match(
                 let rest = &line[pos + 15..];
                 let tokens: Vec<&str> = rest.split_whitespace().collect();
                 if !tokens.is_empty()
-                    && let Ok(val) = tokens[0].parse::<f64>() {
-                        elo_diff = Some(val);
-                        updated = true;
-                    }
+                    && let Ok(val) = tokens[0].trim_end_matches(',').parse::<f64>()
+                    && val.is_finite()
+                {
+                    elo_diff = Some(val);
+                    updated = true;
+                }
                 if tokens.len() >= 3 && tokens[1] == "+/-" {
                     let err_str = tokens[2].trim_end_matches(',');
-                    if let Ok(err) = err_str.parse::<f64>() {
+                    if let Ok(err) = err_str.parse::<f64>()
+                        && err.is_finite()
+                    {
                         elo_error = Some(err);
+                    } else {
+                        elo_error = None;
                     }
                 }
             }
@@ -405,56 +464,43 @@ pub fn run_sprt_match(
         }
 
         if updated {
-            let win_pct = if total_games > 0 {
-                (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0
-            } else {
-                0.0
+            let max_games = config.max_rounds * 2;
+            let display_elo = elo_diff.or_else(|| estimate_elo_from_score(wins, losses, draws));
+            let elo_str = match (display_elo, elo_error) {
+                (Some(e), Some(err)) => format!("Elo {:>+5.1}±{:<4.1}", e, err),
+                (Some(e), None) => format!("Elo {:>+5.1}", e),
+                _ => "Elo N/A".to_string(),
             };
-            let elo_str = match (elo_diff, elo_error) {
-                (Some(e), Some(err)) => format!("Elo: {:>+5.1} +/- {:<4.1}", e, err),
-                (Some(e), None) => format!("Elo: {:>+5.1}", e),
-                _ => "Elo:   ...".to_string(),
-            };
-            let llr_str = match (llr, lbound, ubound) {
-                (Some(l), Some(lb), Some(ub)) => format!("LLR: {:>+5.2} [{:.2}, {:.2}]", l, lb, ub),
-                (Some(l), _, _) => format!("LLR: {:>+5.2}", l),
-                _ => "LLR: ...".to_string(),
+            let llr_str = match llr {
+                Some(l) => format!("LLR {:>+5.2}", l),
+                None => "LLR N/A".to_string(),
             };
             print!(
-                "\r  [SPRT Match] Games: {:>3}/{} (+{} -{} ={}) [{:.1}%] | {} | {}  ",
-                total_games, config.max_rounds * 2, wins, losses, draws, win_pct, elo_str, llr_str
+                "\r{} | ⚔️ {:>3}/{} +{}-{}={} {} {}     ",
+                label, total_games, max_games, wins, losses, draws, elo_str, llr_str
             );
             let _ = std::io::stdout().flush();
 
-            // Early Mathematical Cutoff for Candidate vs Champion:
-            let max_games = config.max_rounds * 2;
-            let remaining = max_games.saturating_sub(total_games);
-            if total_games >= 20 {
-                if wins > losses + remaining {
-                    println!(
-                        "\n  ⚡ Early Cutoff: Champion defeat mathematically guaranteed (+{}W vs max possible {}W with {} games left).",
-                        wins, losses + remaining, remaining
-                    );
-                    explicit_decision = Some(SprtDecision::AcceptedH1);
-                    let _ = child.kill();
-                    break;
-                } else if wins + remaining <= losses {
-                    println!(
-                        "\n  ⚡ Early Cutoff: Defeating Champion mathematically impossible (max possible {}W vs {}L with {} games left).",
-                        wins + remaining, losses, remaining
-                    );
-                    explicit_decision = Some(SprtDecision::AcceptedH0);
-                    let _ = child.kill();
-                    break;
-                }
+            // Early Mathematical Cutoff respecting H1 hypothesis (config.elo1):
+            if line.contains("SPRT:")
+                && let Some(cutoff_decision) =
+                    check_sprt_early_cutoff(wins, losses, draws, max_games, config.elo1)
+            {
+                early_cutoff = true;
+                explicit_decision = Some(cutoff_decision);
+                let _ = child.kill();
+                break;
             }
         }
     }
 
     let status = child.wait().map_err(|e| format!("Cutechess process wait error: {}", e))?;
-    println!();
     if !status.success() && explicit_decision.is_none() {
-        eprintln!("[sprt] Warning: Cutechess exited with status: {}", status);
+        eprintln!("\n[sprt] Warning: Cutechess exited with status: {}", status);
+    }
+
+    if elo_diff.is_none() {
+        elo_diff = estimate_elo_from_score(wins, losses, draws);
     }
 
     // Determine final decision
@@ -486,38 +532,31 @@ pub fn run_sprt_match(
     };
     let (promoted, promo_reason) = temp_res.should_promote(config.elo1);
 
-    let win_pct = if total_games > 0 {
-        (wins as f64 + 0.5 * draws as f64) / total_games as f64 * 100.0
-    } else {
-        0.0
-    };
     let elo_disp = match (elo_diff, elo_error) {
-        (Some(diff), Some(err)) => format!("Elo: {:+.1} +/- {:.1}", diff, err),
-        (Some(diff), None) => format!("Elo: {:+.1}", diff),
-        _ => "Elo: N/A".to_string(),
+        (Some(diff), Some(err)) => format!("Elo {:+.1}±{:.1}", diff, err),
+        (Some(diff), None) => format!("Elo {:+.1}", diff),
+        _ => "Elo N/A".to_string(),
     };
-    let llr_disp = match (llr, lbound, ubound) {
-        (Some(l), Some(lb), Some(ub)) => format!("LLR: {:.2} [{:.2}, {:.2}]", l, lb, ub),
-        (Some(l), _, _) => format!("LLR: {:.2}", l),
-        _ => "LLR: N/A".to_string(),
+    let llr_disp = match llr {
+        Some(l) => format!("LLR {:+.2}", l),
+        None => "LLR N/A".to_string(),
     };
 
     let verdict_icon = if promoted { "🏆" } else { "🛡️" };
-    let verdict_msg = match &decision {
-        SprtDecision::AcceptedH1 => "ACCEPT H1 (Statistically superior search weights)",
-        SprtDecision::AcceptedH0 => "REJECT H0 (Failed to defeat Champion)",
-        SprtDecision::Inconclusive => {
-            if promoted {
-                "DECISIVE LEAD (Qualified for promotion)"
-            } else {
-                "INCONCLUSIVE (Champion retained)"
-            }
+    let verdict_msg = if promoted {
+        "PROMOTED"
+    } else {
+        match &decision {
+            SprtDecision::AcceptedH1 => "ACCEPT H1",
+            SprtDecision::AcceptedH0 => "REJECT H0",
+            SprtDecision::Inconclusive => "INCONCLUSIVE",
         }
     };
+    let cutoff_tag = if early_cutoff { " [cutoff]" } else { "" };
 
     println!(
-        "  {} [SPRT Result] {}: +{} -{} ={} ({:.1}%, {} games) | {} | {}",
-        verdict_icon, verdict_msg, wins, losses, draws, win_pct, total_games, elo_disp, llr_disp
+        "\r{} | {} {} ({}g +{}-{}={} {} {}){}     ",
+        label, verdict_icon, verdict_msg, total_games, wins, losses, draws, elo_disp, llr_disp, cutoff_tag
     );
 
     let verdict_str = match &decision {
@@ -759,24 +798,39 @@ mod tests {
     #[test]
     fn test_mathematical_cutoff_logic() {
         let max_games = 120usize;
+        let elo1 = 15.0; // required score = 0.52157 * 120 = 62.59 pts
 
-        // Case 1: Early in match (e.g. 10 games) -> neither cutoff should trigger
-        let (w, l, d) = (6, 2, 2);
-        let total = w + l + d;
-        let remaining = max_games - total;
-        assert!(!(w > l + remaining));
-        assert!(!(w + remaining <= l));
+        // Case 1: Early in match (10 games < 20) -> no cutoff
+        assert_eq!(check_sprt_early_cutoff(8, 0, 2, max_games, elo1), None);
 
-        // Case 2: Trailing so badly that winning 100% of remaining games cannot beat losses
-        let (w, l, d) = (15, 60, 5); // total = 80, remaining = 40
-        let total = w + l + d;
-        let remaining = max_games - total;
-        assert!(w + remaining <= l); // 15 + 40 = 55 <= 60 (Impossible to win!)
+        // Case 2: Small positive lead (+22 -19 =77, 2 games left):
+        // Worst case = 60.5 pts, best case = 62.5 < 62.59 -> must NOT promote; impossible to reach H1 -> AcceptedH0
+        assert_eq!(
+            check_sprt_early_cutoff(22, 19, 77, max_games, elo1),
+            Some(SprtDecision::AcceptedH0)
+        );
 
-        // Case 3: Leading so overwhelmingly that losing 100% of remaining games still preserves victory
-        let (w, l, d) = (65, 10, 5); // total = 80, remaining = 40
-        let total = w + l + d;
-        let remaining = max_games - total;
-        assert!(w > l + remaining); // 65 > 10 + 40 = 50 (Guaranteed victory!)
+        // Case 3: Still open (+24 -19 =75, 2 games left):
+        // Worst case = 61.5 < 62.59, best case = 63.5 >= 62.59 -> keep playing
+        assert_eq!(check_sprt_early_cutoff(24, 19, 75, max_games, elo1), None);
+
+        // Case 4: Worst case meets H1 (+27 -19 =72, 2 games left):
+        // Worst case = 63.0 >= 62.59 -> AcceptedH1
+        assert_eq!(
+            check_sprt_early_cutoff(27, 19, 72, max_games, elo1),
+            Some(SprtDecision::AcceptedH1)
+        );
+    }
+
+    #[test]
+    fn test_estimate_elo_from_score() {
+        assert_eq!(estimate_elo_from_score(0, 0, 0), None);
+        assert_eq!(estimate_elo_from_score(10, 0, 0), None);
+        assert_eq!(estimate_elo_from_score(0, 10, 0), None);
+        let even = estimate_elo_from_score(10, 10, 20).unwrap();
+        assert!(even.abs() < 1e-6);
+        // +41 -13 =40 -> 64.9% -> ~+106.7 Elo
+        let strong = estimate_elo_from_score(41, 13, 40).unwrap();
+        assert!(strong > 100.0 && strong < 115.0);
     }
 }

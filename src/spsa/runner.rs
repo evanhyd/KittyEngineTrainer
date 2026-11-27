@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MatchResult {
     pub wins: usize,
@@ -22,6 +23,7 @@ pub enum SprtDecisionType {
     Inconclusive,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SprtResult {
     pub decision: SprtDecisionType,
@@ -34,6 +36,29 @@ pub struct SprtResult {
     pub ubound: f64,
     pub elo_diff: f64,
     pub elo_error: f64,
+}
+
+use crate::sprt::{self, SprtDecision};
+
+/// Minimum score fraction in (0, 1) required to achieve `elo` Elo difference.
+pub fn required_score_fraction(elo: f64) -> f64 {
+    sprt::required_score_fraction(elo)
+}
+
+/// Evaluates whether an SPRT match is already mathematically decided against
+/// the configured `elo1` target given `wins`, `losses`, `draws`, and `max_games`.
+pub fn check_sprt_early_cutoff(
+    wins: usize,
+    losses: usize,
+    draws: usize,
+    max_games: usize,
+    elo1: f64,
+) -> Option<SprtDecisionType> {
+    sprt::check_sprt_early_cutoff(wins, losses, draws, max_games, elo1).map(|d| match d {
+        SprtDecision::AcceptedH1 => SprtDecisionType::AcceptedH1,
+        SprtDecision::AcceptedH0 => SprtDecisionType::AcceptedH0,
+        SprtDecision::Inconclusive => SprtDecisionType::Inconclusive,
+    })
 }
 
 fn to_clean_path<P: AsRef<Path>>(p: P) -> PathBuf {
@@ -102,6 +127,7 @@ impl CutechessRunner {
     /// Runs an SPSA gradient match between Theta+ and Theta- in paired games.
     pub fn run_spsa_match(
         &self,
+        label: &str,
         name_plus: &str,
         config_plus_path: &Path,
         name_minus: &str,
@@ -212,13 +238,17 @@ impl CutechessRunner {
                 let rest = &line[pos + 15..];
                 let tokens: Vec<&str> = rest.split_whitespace().collect();
                 if !tokens.is_empty()
-                    && let Ok(v) = tokens[0].parse::<f64>() {
-                        elo_diff = v;
-                        updated = true;
-                    }
+                    && let Ok(v) = tokens[0].trim_end_matches(',').parse::<f64>()
+                    && v.is_finite()
+                {
+                    elo_diff = v;
+                    updated = true;
+                }
                 if tokens.len() >= 3 && tokens[1] == "+/-" {
                     let err_str = tokens[2].trim_end_matches(',');
-                    if let Ok(err) = err_str.parse::<f64>() {
+                    if let Ok(err) = err_str.parse::<f64>()
+                        && err.is_finite()
+                    {
                         elo_error = err;
                     }
                 }
@@ -232,32 +262,22 @@ impl CutechessRunner {
                     0.0
                 };
                 print!(
-                    "\r  [SPSA Batch] Games: {:>3}/{} (+{} -{} ={}) [{:.1}%] | Elo: {:>+5.1} +/- {:<4.1}  ",
-                    total, total_games, wins, losses, draws, pct, elo_diff, elo_error
+                    "\r[{}] {:>2}/{} (+{} -{} ={}) {:>5.1}% | Elo: {:>+5.1} +/- {:<4.1}   ",
+                    label, total, total_games, wins, losses, draws, pct, elo_diff, elo_error
                 );
                 let _ = std::io::stdout().flush();
 
                 // Early Mathematical Cutoff for SPSA iteration:
-                // If one side has won strictly more than half of total_games,
-                // the batch winner is mathematically irreversible!
                 let remaining = total_games.saturating_sub(total);
                 let min_check = (total_games / 3).max(10);
-                if total >= min_check {
-                    if wins > losses + remaining {
-                        println!(
-                            "\n  ⚡ Early Cutoff: Theta+ locked in irreversible lead ({}W vs max possible {}W with {} games left).",
-                            wins, losses + remaining, remaining
-                        );
-                        let _ = child.kill();
-                        break;
-                    } else if losses > wins + remaining {
-                        println!(
-                            "\n  ⚡ Early Cutoff: Theta- locked in irreversible lead ({}W vs max possible {}W with {} games left).",
-                            losses, wins + remaining, remaining
-                        );
-                        let _ = child.kill();
-                        break;
-                    }
+                if remaining > 0 && total >= min_check && (wins > losses + remaining || losses > wins + remaining) {
+                    print!(
+                        "\r[{}] {:>2}/{} (+{} -{} ={}) {:>5.1}% | Elo: {:>+5.1} +/- {:<4.1} [cutoff]",
+                        label, total, total_games, wins, losses, draws, pct, elo_diff, elo_error
+                    );
+                    let _ = std::io::stdout().flush();
+                    let _ = child.kill();
+                    break;
                 }
             }
         }
@@ -418,13 +438,17 @@ impl CutechessRunner {
                 let rest = &line[pos + 15..];
                 let tokens: Vec<&str> = rest.split_whitespace().collect();
                 if !tokens.is_empty()
-                    && let Ok(v) = tokens[0].parse::<f64>() {
-                        elo_diff = v;
-                        updated = true;
-                    }
+                    && let Ok(v) = tokens[0].trim_end_matches(',').parse::<f64>()
+                    && v.is_finite()
+                {
+                    elo_diff = v;
+                    updated = true;
+                }
                 if tokens.len() >= 3 && tokens[1] == "+/-" {
                     let err_str = tokens[2].trim_end_matches(',');
-                    if let Ok(err) = err_str.parse::<f64>() {
+                    if let Ok(err) = err_str.parse::<f64>()
+                        && err.is_finite()
+                    {
                         elo_error = err;
                     }
                 }
@@ -470,38 +494,26 @@ impl CutechessRunner {
                     0.0
                 };
                 print!(
-                    "\r  [SPRT Match] Games: {:>3}/{} (+{} -{} ={}) [{:.1}%] | Elo: {:>+5.1} +/- {:<4.1} | LLR: {:>+5.2} [{:.2}, {:.2}]  ",
+                    "\r  [SPRT] {:>3}/{} (+{} -{} ={}) {:>5.1}% | Elo: {:>+5.1} +/- {:<4.1} | LLR: {:>+5.2} [{:.2}, {:.2}]   ",
                     total, max_rounds * 2, wins, losses, draws, pct, elo_diff, elo_error, llr, lbound, ubound
                 );
                 let _ = std::io::stdout().flush();
 
-                // Early Mathematical Cutoff for Candidate vs Baseline:
+                // Early Mathematical Cutoff respecting configured Elo demand (elo1):
                 let max_games = max_rounds * 2;
-                let remaining = max_games.saturating_sub(total);
-                if total >= 20 {
-                    if wins > losses + remaining {
-                        println!(
-                            "\n  ⚡ Early Cutoff: Promotion mathematically guaranteed (Candidate +{}W vs max possible {}W with {} games left).",
-                            wins, losses + remaining, remaining
-                        );
-                        explicit_decision = Some(SprtDecisionType::AcceptedH1);
-                        let _ = child.kill();
-                        break;
-                    } else if wins + remaining <= losses {
-                        println!(
-                            "\n  ⚡ Early Cutoff: Defeating baseline mathematically impossible (max possible {}W vs {}L with {} games left).",
-                            wins + remaining, losses, remaining
-                        );
-                        explicit_decision = Some(SprtDecisionType::AcceptedH0);
-                        let _ = child.kill();
-                        break;
-                    }
+                if line.contains("SPRT:")
+                    && let Some(cutoff_decision) = check_sprt_early_cutoff(wins, losses, draws, max_games, elo1)
+                {
+                    explicit_decision = Some(cutoff_decision);
+                    let _ = child.kill();
+                    break;
                 }
             }
         }
 
         let status = child.wait().map_err(|e| format!("Cutechess process wait error: {}", e))?;
-        println!();
+        print!("\r{: <96}\r", "");
+        let _ = std::io::stdout().flush();
 
         let total = wins + losses + draws;
         if total == 0 {
@@ -533,5 +545,47 @@ impl CutechessRunner {
             elo_diff,
             elo_error,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_required_score_fraction() {
+        assert!((required_score_fraction(0.0) - 0.5).abs() < 1e-9);
+        // +20 Elo requires ~52.875%
+        let p20 = required_score_fraction(20.0);
+        assert!(p20 > 0.528 && p20 < 0.529);
+    }
+
+    #[test]
+    fn test_sprt_early_cutoff_respects_elo_bound() {
+        // 24-game match with +20 Elo demand -> requires 12.69 pts
+        // 2W 2L 19D (23 games, 1 left): even winning the last game gives 3W 2L 19D = 12.5 pts (+14.5 Elo < 20.0) -> AcceptedH0
+        assert_eq!(
+            check_sprt_early_cutoff(2, 2, 19, 24, 20.0),
+            Some(SprtDecisionType::AcceptedH0)
+        );
+
+        // 100-game match with +20 Elo demand -> requires 52.875 pts
+        // +10 -8 =79 (97 games, 3 left): positive Elo, but max possible is 49.5 + 3 = 52.5 < 52.875 -> AcceptedH0
+        assert_eq!(
+            check_sprt_early_cutoff(10, 8, 79, 100, 20.0),
+            Some(SprtDecisionType::AcceptedH0)
+        );
+
+        // +10 -8 =78 (96 games, 4 left): max possible is 49.0 + 4 = 53.0 >= 52.875 -> still open
+        assert_eq!(check_sprt_early_cutoff(10, 8, 78, 100, 20.0), None);
+
+        // +45 -5 =20 (70 games, 30 left): current score 55.0 >= 52.875 -> guaranteed >= +20 Elo -> AcceptedH1
+        assert_eq!(
+            check_sprt_early_cutoff(45, 5, 20, 100, 20.0),
+            Some(SprtDecisionType::AcceptedH1)
+        );
+
+        // Finished match (remaining == 0) does not trigger early cutoff
+        assert_eq!(check_sprt_early_cutoff(3, 2, 19, 24, 20.0), None);
     }
 }

@@ -256,13 +256,6 @@ impl SPSATuner {
 
     pub fn run_iteration(&mut self) -> Result<(), String> {
         let k = self.optimizer.iteration;
-        let (ak, ck) = self.optimizer.get_step_sizes(k);
-
-        println!("--------------------------------------------------------------------------------");
-        println!(
-            "🎯 SPSA ITERATION {} (Games: {}) | ak={:.5}, ck={:.5} | TC: {} | Concurrency: {} | Batch: {}",
-            k + 1, self.optimizer.total_games, ak, ck, self.runner.config.time_control, self.runner.config.concurrency, self.settings.games_per_iteration
-        );
 
         // 1. Generate perturbations
         let (deltas, theta_plus, theta_minus) = self.optimizer.generate_perturbations();
@@ -274,7 +267,9 @@ impl SPSATuner {
 
         // 2. Run match between Theta+ and Theta-
         let pgn_file = self.logs_dir.join(format!("iter_{}_plus_vs_minus.pgn", k + 1));
+        let label = format!("SPSA #{}", k + 1);
         let match_res = self.runner.run_spsa_match(
+            &label,
             "Theta_Plus",
             &plus_yaml,
             "Theta_Minus",
@@ -282,11 +277,6 @@ impl SPSATuner {
             self.settings.games_per_iteration,
             Some(&pgn_file),
         )?;
-
-        println!(
-            "  🏁 Match Result: Theta+ scored {}W / {}L / {}D ({:.1}/{}) | Diff: {:+.3} | Elo: {:+.1} +/- {:.1}",
-            match_res.wins, match_res.losses, match_res.draws, match_res.score, match_res.total_games, match_res.score_diff, match_res.elo_diff, match_res.elo_error
-        );
 
         // 3. Update parameters
         self.optimizer.update(&deltas, match_res.score_diff, match_res.total_games, match_res.elo_diff);
@@ -305,23 +295,14 @@ impl SPSATuner {
         let top_rate = win_rate.max(1.0 - win_rate);
         let elo_gain = match_res.elo_diff.abs();
 
-        let mut should_verify = false;
-        let mut trigger_reason = "";
-
-        if (k + 1) % self.settings.verify_interval_iterations == 0 {
-            should_verify = true;
-            trigger_reason = "Periodic verification interval reached";
-        } else if match_res.total_games > 0 && (elo_gain >= self.settings.verify_elo_threshold || top_rate >= self.settings.verify_win_rate_threshold) {
-            should_verify = true;
-            trigger_reason = "Decisive iteration performance threshold exceeded";
-        }
+        let should_verify = (k + 1) % self.settings.verify_interval_iterations == 0
+            || (match_res.total_games > 0
+                && (elo_gain >= self.settings.verify_elo_threshold
+                    || top_rate >= self.settings.verify_win_rate_threshold));
 
         if should_verify {
             let diffs = self.deployer.get_parameter_diff(&deployed_theta, &self.optimizer.theta);
-            if diffs.is_empty() {
-                println!("  [Verify] Candidate parameters are identical to baseline after rounding. Skipping SPRT.");
-            } else {
-                println!("  ⚡ Trigger: {} ({} discrete parameters differ). Starting SPRT verification...", trigger_reason, diffs.len());
+            if !diffs.is_empty() {
                 self.verify_and_deploy_if_better(&deployed_theta)?;
             }
         }
@@ -335,7 +316,6 @@ impl SPSATuner {
     ) -> Result<bool, String> {
         let diffs = self.deployer.get_parameter_diff(deployed_theta, &self.optimizer.theta);
         if diffs.is_empty() {
-            println!("  [SPRT Verification] Candidate discretized parameters are identical to baseline. Skipping.");
             return Ok(false);
         }
 
@@ -343,20 +323,6 @@ impl SPSATuner {
         let base_yaml = self.state_dir.join("deployed_baseline.yaml");
         write_search_config(&self.optimizer.theta, &cand_yaml)?;
         write_search_config(deployed_theta, &base_yaml)?;
-
-        println!("--------------------------------------------------------------------------------");
-        println!("⚔️ INITIATING SPRT STATISTICAL VERIFICATION (Candidate vs Deployed Baseline)");
-        println!(
-            "  Bounds: Elo [{}, {}] | Alpha: {} | Beta: {} | Max Rounds: {}",
-            self.settings.sprt_elo0, self.settings.sprt_elo1, self.settings.sprt_alpha, self.settings.sprt_beta, self.settings.sprt_max_rounds
-        );
-        println!("  Divergent Parameters ({}):", diffs.len());
-        for (k, old_val, new_val) in diffs.iter().take(8) {
-            println!("    - {:<38} : {:>8} -> {:<8}", k, old_val, new_val);
-        }
-        if diffs.len() > 8 {
-            println!("    ... and {} more parameters", diffs.len() - 8);
-        }
 
         let sprt_pgn = self.logs_dir.join(format!("sprt_verify_iter_{}.pgn", self.optimizer.iteration));
         let result = self.runner.run_sprt_verification(
@@ -372,48 +338,71 @@ impl SPSATuner {
             Some(&sprt_pgn),
         )?;
 
-        println!(
-            "  🏁 SPRT Finished: Decision = {:?} | Score: +{} -{} ={} ({} games) | Elo: {:+.1} +/- {:.1} | LLR: {:.2} [{:.2}, {:.2}]",
-            result.decision, result.wins, result.losses, result.draws, result.total_games, result.elo_diff, result.elo_error, result.llr, result.lbound, result.ubound
-        );
-
-        let is_promoted = if result.decision == SprtDecisionType::AcceptedH1 {
-            true
-        } else {
-            // Net positive promotion
-            result.total_games > 0 && (result.wins > result.losses || (result.wins >= result.losses && result.elo_diff > 0.0))
+        let is_promoted = match result.decision {
+            SprtDecisionType::AcceptedH1 => true,
+            SprtDecisionType::AcceptedH0 => false,
+            SprtDecisionType::Inconclusive => {
+                result.total_games > 0
+                    && result.wins > result.losses
+                    && result.elo_diff >= self.settings.sprt_elo1
+                    && result.llr > 0.0
+            }
         };
+
+        let verdict_icon = if is_promoted { "🏆" } else { "🛡️" };
+        let verdict_label = match result.decision {
+            SprtDecisionType::AcceptedH1 => "ACCEPT H1",
+            SprtDecisionType::AcceptedH0 => "REJECT H0",
+            SprtDecisionType::Inconclusive => if is_promoted { "PROMOTE" } else { "REJECT" },
+        };
+        let pct = if result.total_games > 0 {
+            (result.wins as f64 + 0.5 * result.draws as f64) / result.total_games as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {} [SPRT] {} | +{} -{} ={} ({:.1}%, {}g) | Elo: {:+.1} +/- {:.1} | LLR: {:+.2}",
+            verdict_icon, verdict_label, result.wins, result.losses, result.draws, pct, result.total_games,
+            result.elo_diff, result.elo_error, result.llr
+        );
 
         if is_promoted {
             let stats_summary = format!(
-                "+{} -{} ={} ({} games) | Elo: {:+.1} +/- {:.1} | LLR: {:.2}",
+                "+{} -{} ={} ({}g) | Elo: {:+.1} +/- {:.1} | LLR: {:+.2}",
                 result.wins, result.losses, result.draws, result.total_games, result.elo_diff, result.elo_error, result.llr
             );
             let reason = if result.decision == SprtDecisionType::AcceptedH1 {
-                "SPRT Accepted H1 (Statistically superior search parameters)"
+                "SPRT Accepted H1"
             } else {
-                "Decisive net positive edge over deployed baseline"
+                "Net Elo edge >= sprt_elo1"
             };
             self.deployer.deploy(&self.optimizer.theta, reason, self.optimizer.iteration, Some(&stats_summary))?;
             Ok(true)
         } else {
-            println!("  [Verification] Candidate did not outperform baseline. Retaining current deployed configuration.");
             Ok(false)
         }
     }
 
     pub fn run_loop(&mut self, max_iterations: usize) {
         println!("================================================================================");
-        println!("🚀 KITTYENGINE SPSA SEARCH OPTIMIZER (Native Rust)");
-        println!("================================================================================");
-        println!("  Target Iterations : {}", max_iterations);
-        println!("  Batch Size        : {} games/iteration", self.settings.games_per_iteration);
-        println!("  Time Control      : {}", self.runner.config.time_control);
-        println!("  Concurrency       : {} threads", self.runner.config.concurrency);
-        println!("  Engine Config     : {}", self.deployer.engine_config_path.display());
-        println!("  Current Iteration : {}", self.optimizer.iteration);
-        println!("  Total Games Played: {}", self.optimizer.total_games);
-        println!("  (Press Ctrl+C to stop cleanly anytime with saved state)");
+        println!(
+            "SPSA Tuner | Iter {}..{} ({}g) | Batch {} | TC {} | {}t",
+            self.optimizer.iteration + 1,
+            max_iterations,
+            self.optimizer.total_games,
+            self.settings.games_per_iteration,
+            self.runner.config.time_control,
+            self.runner.config.concurrency,
+        );
+        println!(
+            "  SPRT: Elo [{}, {}] (a={}, b={}, max {}g) | Config: {} (Ctrl+C to stop)",
+            self.settings.sprt_elo0,
+            self.settings.sprt_elo1,
+            self.settings.sprt_alpha,
+            self.settings.sprt_beta,
+            self.settings.sprt_max_rounds * 2,
+            self.deployer.engine_config_path.display(),
+        );
         println!("================================================================================");
 
         crate::signal::init();

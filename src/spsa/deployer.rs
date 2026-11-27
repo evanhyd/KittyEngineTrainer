@@ -77,7 +77,6 @@ impl Deployer {
             let backup_name = format!("search_config_backup_{}.yaml", now);
             let backup_path = self.history_dir.join(backup_name);
             let _ = fs::copy(&self.engine_config_path, &backup_path);
-            println!("  [Deployer] Backed up old config: {}", backup_path.display());
         }
 
         // 2. Write new config to engine directory only
@@ -88,18 +87,12 @@ impl Deployer {
 
         let diffs = self.get_parameter_diff(&old_cfg, new_theta);
 
-        println!("================================================================================");
-        println!("🚀 DEPLOYED NEW SEARCH CONFIGURATION (Iteration {})", iteration);
-        println!("  Target: {}", self.engine_config_path.display());
-        println!("  Reason: {}", reason);
-        if let Some(s) = stats_str {
-            println!("  Stats:  {}", s);
-        }
-        println!("  Changed Parameters ({}/{}):", diffs.len(), SEARCH_PARAMS.len());
-        for (k, old_val, new_val) in &diffs {
-            println!("    - {:<38} : {:>8} -> {:<8}", k, old_val, new_val);
-        }
-        println!("================================================================================");
+        println!(
+            "  🚀 Deployed iter {} -> {} ({} params changed)",
+            iteration,
+            self.engine_config_path.display(),
+            diffs.len()
+        );
 
         // 3. Append to log
         use std::io::Write;

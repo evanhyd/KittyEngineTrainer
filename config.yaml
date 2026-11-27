@@ -2,18 +2,18 @@
 # KittyEngineTrainer Configuration (Unified NNUE, SPRT & SPSA)
 # ==============================================================================
 
-# Target 360 superbatches * 4096 batches * 16384 batch_size = ~24.16 Billion positions
-# (~1.0 full epoch over 24B unique filtered positions)
-superbatches: 360
+# Target 720 superbatches * 4096 batches * 16384 batch_size = ~48.32 Billion positions (~2.0 epochs)
+superbatches: 720
 
 # WDL lambda distillation factor (92% deep search score, 8% game outcome)
 wdl: 0.08
 
-# Peak learning rate for Cosine Annealing decay (tuned for 360 * 4096 = 1.47M AdamW steps on NNUESGD8)
-lr: 0.0003
+# Cosine Annealing LR for continuing from SB 360 -> 720:
+# At SB 361/720 (progress = 0.50), effective LR starts at ~0.0000205 and decays smoothly to min_lr
+lr: 0.00004
 
-# Minimum learning rate at cycle completion
-min_lr: 0.000005
+# Minimum learning rate at cycle completion (SB 720)
+min_lr: 0.000001
 
 # Training batch size in positions (safe for 6 GB GTX 1660 Ti VRAM)
 batch_size: 16384
@@ -26,7 +26,7 @@ batches_per_superbatch: 4096
 eval_positions_per_pack: 100000
 
 # Checkpoint & SPRT interval: every 10 superbatches (~every 671M positions)
-save_interval: 10
+save_interval: 5
 
 # ==============================================================================
 # Unified Engine & Match Runner Settings (Shared by SPRT & SPSA)
